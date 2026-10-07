@@ -18,7 +18,9 @@ const
   GLFW_LIB = 'glfw3.dll';
 {$ENDIF}
 {$IFDEF LINUX}
-  GLFW_LIB = 'libglfw.so.3';
+  { Компоновщик получит -lglfw, поэтому при сборке нужен пакет разработчика
+    (libglfw3-dev), который кладёт симлинк libglfw.so рядом с libglfw.so.3. }
+  GLFW_LIB = 'glfw';
 {$ENDIF}
 {$IFDEF DARWIN}
   GLFW_LIB = 'libglfw.3.dylib';

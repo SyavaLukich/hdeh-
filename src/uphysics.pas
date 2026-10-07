@@ -36,9 +36,15 @@ const
 
   { Настройки решателя. Значения подобраны для шага 1/120 с. }
   PHYS_VEL_ITERS     = 8;
-  PHYS_POS_ITERS     = 3;
+  PHYS_POS_ITERS     = 4;
   PHYS_SLOP          = 0.005;   { допустимое проникновение, м }
-  PHYS_BAUMGARTE     = 0.2;     { доля ошибки, исправляемая за шаг }
+  { Смещение Баумгарта в решателе скоростей оставлено минимальным: оно
+    добавляет телу энергию и на быстром ударе даёт заметный "подскок".
+    Проникновение убирает отдельный позиционный проход (split impulse). }
+  PHYS_BAUMGARTE     = 0.0;
+  PHYS_MAX_BIAS      = 2.0;     { ограничение скорости выталкивания, м/с }
+  PHYS_POS_RELAX     = 0.6;     { доля ошибки, снимаемая за итерацию }
+  PHYS_PERTURB       = 0.03;    { угол доворота при поиске доп. точек, рад }
   PHYS_REST_THRESH   = 1.0;     { ниже этой скорости отскок не считается }
   PHYS_SLEEP_LIN     = 0.08;
   PHYS_SLEEP_ANG     = 0.10;
@@ -379,15 +385,56 @@ end;
   Манифолды
   ========================================================================= }
 
+{ Поиск манифолда по паре тел. Линейный перебор здесь был бы квадратичным
+  (тысячи пар против тысяч манифолдов), поэтому держим хеш-таблицу с
+  цепочками: таблица и цепочки -- обычные массивы, память не выделяется. }
+const
+  MF_HASH_SIZE = 16384;        { степень двойки, маска ниже }
+  MF_HASH_MASK = MF_HASH_SIZE - 1;
+
+var
+  g_mf_hash: array[0..MF_HASH_SIZE - 1] of Integer;
+  g_mf_next: array[0..PHYS_MAX_MANIFOLDS - 1] of Integer;
+
+function mf_key(a, b: Integer): Integer; inline;
+begin
+  { Перемешивание большими простыми числами -- классика из Teschner et al. }
+  Result := ((a * 73856093) xor (b * 19349663)) and MF_HASH_MASK;
+end;
+
+procedure mf_hash_rebuild;
+var i, k: Integer;
+begin
+  FillChar(g_mf_hash, SizeOf(g_mf_hash), $FF);
+  for i := 0 to g_nmanifolds - 1 do
+  begin
+    k := mf_key(g_manifolds[i].a, g_manifolds[i].b);
+    g_mf_next[i] := g_mf_hash[k];
+    g_mf_hash[k] := i;
+  end;
+end;
+
+procedure mf_hash_insert(i: Integer); inline;
+var k: Integer;
+begin
+  k := mf_key(g_manifolds[i].a, g_manifolds[i].b);
+  g_mf_next[i] := g_mf_hash[k];
+  g_mf_hash[k] := i;
+end;
+
 function find_manifold(a, b: Integer): Integer;
 var i: Integer;
 begin
-  for i := 0 to g_nmanifolds - 1 do
+  i := g_mf_hash[mf_key(a, b)];
+  while i >= 0 do
+  begin
     if (g_manifolds[i].a = a) and (g_manifolds[i].b = b) then
     begin
       Result := i;
       Exit;
     end;
+    i := g_mf_next[i];
+  end;
   Result := -1;
 end;
 
@@ -485,6 +532,42 @@ end;
 var
   g_mf_tmp: array[0..PHYS_MAX_MANIFOLDS - 1] of TManifold;
 
+{ Доп. точки контакта за счёт малого доворота тела A вокруг осей,
+  перпендикулярных нормали. Приём из Bullet: на первом кадре удара GJK даёт
+  всего одну точку, и плоско падающий ящик успевает подпрыгнуть и уехать
+  вбок. Четыре дешёвых повторных запроса сразу дают полную площадь опоры. }
+procedure add_perturbed_points(var mf: TManifold; a, b: Integer;
+                               const res: TGJKResult);
+var
+  t1, t2, axis, ptA: TVec3;
+  qp: TQuat;
+  pa2, pb0: TPose;
+  r2: TGJKResult;
+  k: Integer;
+  ang: Single;
+begin
+  v3_basis(res.normal, t1, t2);
+  pb0 := phys_pose(b);
+  for k := 0 to 3 do
+  begin
+    if mf.npoints >= PHYS_MAX_POINTS then Exit;
+    ang := k * PI_F * 0.5;
+    axis := v3_add(v3_mul(t1, Cos(ang)), v3_mul(t2, Sin(ang)));
+    qp := q_from_axis(axis, PHYS_PERTURB);
+
+    pa2.p := g_bodies[a].pos;
+    pa2.q := q_mul(qp, g_bodies[a].orient);
+
+    if not gjk_collide(g_shapes[a], pa2, g_shapes[b], pb0, r2) then Continue;
+    { Берём точку, только если она про тот же контакт, а не про другую грань. }
+    if v3_dot(r2.normal, res.normal) < 0.9 then Continue;
+
+    { Возвращаем найденную точку из повёрнутой системы обратно. }
+    ptA := v3_add(pa2.p, q_rotate(q_conj(qp), v3_sub(r2.pointA, pa2.p)));
+    manifold_add_point(mf, ptA, r2.pointB, res.normal, r2.depth);
+  end;
+end;
+
 procedure narrowphase;
 var
   i, k, mi: Integer;
@@ -497,6 +580,7 @@ begin
   { Сначала помечаем все манифолды мёртвыми; выжившие пометим заново. }
   for i := 0 to g_nmanifolds - 1 do
     g_manifolds[i].alive := False;
+  mf_hash_rebuild;
 
   g_stat_contacts := 0;
 
@@ -519,6 +603,7 @@ begin
       FillChar(g_manifolds[mi], SizeOf(TManifold), 0);
       g_manifolds[mi].a := a;
       g_manifolds[mi].b := b;
+      mf_hash_insert(mi);
     end;
 
     mf := @g_manifolds[mi];
@@ -537,15 +622,12 @@ begin
     manifold_refresh(mf^);
     manifold_add_point(mf^, res.pointA, res.pointB, res.normal, res.depth);
 
-    Inc(g_stat_contacts, mf^.npoints);
+    { Пока площадка опоры неполная -- добираем точки довёрнутыми запросами.
+      На установившемся контакте этот путь не выполняется вовсе. }
+    if mf^.npoints < 3 then
+      add_perturbed_points(mf^, a, b, res);
 
-    { Контакт будит обоих. }
-    if (v3_lensq(g_bodies[a].linvel) > PHYS_SLEEP_LIN * PHYS_SLEEP_LIN) or
-       (v3_lensq(g_bodies[b].linvel) > PHYS_SLEEP_LIN * PHYS_SLEEP_LIN) then
-    begin
-      phys_wake(a);
-      phys_wake(b);
-    end;
+    Inc(g_stat_contacts, mf^.npoints);
   end;
 
   { Уплотняем список манифолдов. }
@@ -622,8 +704,8 @@ begin
 
       { Смещение Баумгарта: загоняем проникновение обратно, но не быстрее
         PHYS_MAX_CORRECT за шаг, иначе стопки тел взрываются. }
-      cp^.bias := -PHYS_BAUMGARTE * invdt *
-                  fmin(fmax(cp^.penetration - PHYS_SLOP, 0.0), PHYS_MAX_CORRECT);
+      cp^.bias := -fmin(PHYS_BAUMGARTE * invdt *
+                  fmax(cp^.penetration - PHYS_SLOP, 0.0), PHYS_MAX_BIAS);
 
       { Запоминаем скорость сближения для расчёта отскока. }
       rv := v3_sub(v3_add(bb^.linvel, v3_cross(bb^.angvel, cp^.rB)),
@@ -771,7 +853,7 @@ begin
         pen := -v3_dot(v3_sub(wb, wa), mf^.normal);
         if pen <= PHYS_SLOP then Continue;
 
-        corr := fmin(pen - PHYS_SLOP, PHYS_MAX_CORRECT) * 0.4 / totalInv;
+        corr := fmin(pen - PHYS_SLOP, PHYS_MAX_CORRECT) * PHYS_POS_RELAX / totalInv;
         if ba^.invMass > 0 then
           ba^.pos := v3_mad(ba^.pos, mf^.normal, -corr * ba^.invMass);
         if bb^.invMass > 0 then
@@ -833,22 +915,14 @@ begin
     if not (BF_LOCK_ROT in b^.flags) then
       b^.orient := q_integrate(b^.orient, b^.angvel, dt);
 
-    { Засыпание: тело, которое долго почти не двигается, выключается
-      до следующего контакта. Это даёт основной выигрыш в больших сценах. }
+    { Копим время покоя. Само решение "уснуть" принимается позже, сразу
+      для всего острова соприкасающихся тел -- см. resolve_sleeping. }
     v2 := v3_lensq(b^.linvel);
     w2 := v3_lensq(b^.angvel);
     if (v2 < PHYS_SLEEP_LIN * PHYS_SLEEP_LIN) and
        (w2 < PHYS_SLEEP_ANG * PHYS_SLEEP_ANG) and
        not (BF_NOSLEEP in b^.flags) then
-    begin
-      b^.sleepTimer := b^.sleepTimer + dt;
-      if b^.sleepTimer > PHYS_SLEEP_TIME then
-      begin
-        b^.flags := b^.flags + [BF_SLEEPING];
-        b^.linvel := v3_zero;
-        b^.angvel := v3_zero;
-      end;
-    end
+      b^.sleepTimer := b^.sleepTimer + dt
     else
       b^.sleepTimer := 0;
 
@@ -861,6 +935,104 @@ begin
     b := @g_bodies[i];
     if (BF_SLEEPING in b^.flags) and (b^.box.mx.x > b^.box.mn.x) then Continue;
     b^.box := shape_aabb(g_shapes[i], pose_make(b^.pos, b^.orient), 0.05);
+  end;
+end;
+
+{ =========================================================================
+  Засыпание островами
+
+  Тело нельзя усыплять в одиночку: если нижний ящик стопки уснёт раньше
+  верхнего, верхний начнёт его будить, и так до бесконечности. Поэтому
+  соприкасающиеся тела объединяются в острова (система непересекающихся
+  множеств со сжатием путей), и остров засыпает целиком -- только когда
+  успокоились все его тела. Тот же механизм будит остров обратно, если
+  в него прилетело что-то движущееся.
+  ========================================================================= }
+
+var
+  g_island    : array[0..PHYS_MAX_BODIES - 1] of Integer;
+  g_island_min: array[0..PHYS_MAX_BODIES - 1] of Single;
+  g_island_mov: array[0..PHYS_MAX_BODIES - 1] of Boolean;
+
+function island_find(x: Integer): Integer;
+var r, n: Integer;
+begin
+  r := x;
+  while g_island[r] <> r do r := g_island[r];
+  { сжатие пути: следующий поиск будет за один шаг }
+  while g_island[x] <> r do
+  begin
+    n := g_island[x];
+    g_island[x] := r;
+    x := n;
+  end;
+  Result := r;
+end;
+
+procedure island_union(a, b: Integer); inline;
+var ra, rb: Integer;
+begin
+  ra := island_find(a);
+  rb := island_find(b);
+  if ra <> rb then g_island[ra] := rb;
+end;
+
+procedure resolve_sleeping;
+var
+  i, r: Integer;
+  b: PBody;
+begin
+  for i := 0 to g_nbodies - 1 do
+  begin
+    g_island[i] := i;
+    g_island_min[i] := 1.0e30;
+    g_island_mov[i] := False;
+  end;
+
+  { Связываем только динамические пары: статика не передаёт движение. }
+  for i := 0 to g_nmanifolds - 1 do
+    if (g_bodies[g_manifolds[i].a].invMass > 0) and
+       (g_bodies[g_manifolds[i].b].invMass > 0) then
+      island_union(g_manifolds[i].a, g_manifolds[i].b);
+
+  { Сводим по острову минимальное время покоя и признак движения. }
+  for i := 0 to g_nbodies - 1 do
+  begin
+    b := @g_bodies[i];
+    if not body_is_dynamic(b^) then Continue;
+    if not (BF_ENABLED in b^.flags) then Continue;
+    r := island_find(i);
+    if BF_SLEEPING in b^.flags then Continue;
+    if b^.sleepTimer < g_island_min[r] then g_island_min[r] := b^.sleepTimer;
+    if b^.sleepTimer = 0 then g_island_mov[r] := True;
+  end;
+
+  g_stat_awake := 0;
+  for i := 0 to g_nbodies - 1 do
+  begin
+    b := @g_bodies[i];
+    if not body_is_dynamic(b^) then Continue;
+    if not (BF_ENABLED in b^.flags) then Continue;
+    r := island_find(i);
+
+    if g_island_mov[r] then
+    begin
+      { В острове есть реально движущееся тело -- будим всех. }
+      if BF_SLEEPING in b^.flags then
+      begin
+        b^.flags := b^.flags - [BF_SLEEPING];
+        b^.sleepTimer := 0;
+      end;
+    end
+    else if (g_island_min[r] > PHYS_SLEEP_TIME) and
+            not (BF_NOSLEEP in b^.flags) then
+    begin
+      b^.flags := b^.flags + [BF_SLEEPING];
+      b^.linvel := v3_zero;
+      b^.angvel := v3_zero;
+    end;
+
+    if not (BF_SLEEPING in b^.flags) then Inc(g_stat_awake);
   end;
 end;
 
@@ -883,6 +1055,7 @@ begin
 
   integrate_positions(dt);
   solver_positions;
+  resolve_sleeping;
 
   g_phys_time := g_phys_time + dt;
 end;

@@ -32,7 +32,7 @@ const
   HULL_MAX_POINTS   = 64;   { достаточно для игровых выпуклых тел }
 
 type
-  TShapeKind = (SHAPE_SPHERE, SHAPE_BOX, SHAPE_CAPSULE, SHAPE_HULL);
+  TShapeKind = (SK_SPHERE, SK_BOX, SK_CAPSULE, SK_HULL);
 
   { Единая форма. Вместо иерархии классов -- тег и объединение полей.
     Размер записи фиксирован, формы лежат в одном плотном массиве. }
@@ -115,14 +115,14 @@ implementation
 function shape_sphere(r: Single): TShape;
 begin
   FillChar(Result, SizeOf(Result), 0);
-  Result.kind := SHAPE_SPHERE;
+  Result.kind := SK_SPHERE;
   Result.radius := r;
 end;
 
 function shape_box(const half: TVec3): TShape;
 begin
   FillChar(Result, SizeOf(Result), 0);
-  Result.kind := SHAPE_BOX;
+  Result.kind := SK_BOX;
   Result.half := half;
   Result.radius := 0;
 end;
@@ -130,7 +130,7 @@ end;
 function shape_capsule(r, halfheight: Single): TShape;
 begin
   FillChar(Result, SizeOf(Result), 0);
-  Result.kind := SHAPE_CAPSULE;
+  Result.kind := SK_CAPSULE;
   Result.radius := r;
   Result.height := halfheight;
 end;
@@ -140,7 +140,7 @@ var
   i, n: Integer;
 begin
   FillChar(Result, SizeOf(Result), 0);
-  Result.kind := SHAPE_HULL;
+  Result.kind := SK_HULL;
   n := Length(pts);
   if n > HULL_MAX_POINTS then n := HULL_MAX_POINTS;
   for i := 0 to n - 1 do Result.pts[i] := pts[i];
@@ -166,10 +166,10 @@ var
   d, bestd: Single;
 begin
   case s.kind of
-    SHAPE_SPHERE:
+    SK_SPHERE:
       Result := v3_mul(v3_norm(dir), s.radius);
 
-    SHAPE_BOX:
+    SK_BOX:
       begin
         { Самая дешёвая функция поддержки: по знаку компоненты направления. }
         if dir.x >= 0 then Result.x := s.half.x else Result.x := -s.half.x;
@@ -177,14 +177,14 @@ begin
         if dir.z >= 0 then Result.z := s.half.z else Result.z := -s.half.z;
       end;
 
-    SHAPE_CAPSULE:
+    SK_CAPSULE:
       begin
         if dir.y >= 0 then Result := v3(0, s.height, 0)
                       else Result := v3(0, -s.height, 0);
         Result := v3_add(Result, v3_mul(v3_norm(dir), s.radius));
       end;
 
-    SHAPE_HULL:
+    SK_HULL:
       begin
         { Линейный перебор. Для 8..64 точек это 1-2 строки кэша и
           полностью векторизуемый цикл -- быстрее иерархии Dobkin-Kirkpatrick. }
@@ -203,8 +203,6 @@ begin
         if s.radius > 0 then
           Result := v3_add(Result, v3_mul(v3_norm(dir), s.radius));
       end;
-  else
-    Result := v3_zero;
   end;
 end;
 
@@ -225,7 +223,7 @@ var
   dirs: array[0..5] of TVec3;
 begin
   case s.kind of
-    SHAPE_SPHERE:
+    SK_SPHERE:
       begin
         Result.mn := v3(t.p.x - s.radius, t.p.y - s.radius, t.p.z - s.radius);
         Result.mx := v3(t.p.x + s.radius, t.p.y + s.radius, t.p.z + s.radius);
@@ -254,9 +252,9 @@ var
   e: TVec3;
 begin
   case s.kind of
-    SHAPE_SPHERE: Result := (4.0 / 3.0) * PI_F * s.radius * s.radius * s.radius;
-    SHAPE_BOX:    Result := 8.0 * s.half.x * s.half.y * s.half.z;
-    SHAPE_CAPSULE:
+    SK_SPHERE: Result := (4.0 / 3.0) * PI_F * s.radius * s.radius * s.radius;
+    SK_BOX:    Result := 8.0 * s.half.x * s.half.y * s.half.z;
+    SK_CAPSULE:
       Result := PI_F * s.radius * s.radius * (2.0 * s.height) +
                 (4.0 / 3.0) * PI_F * s.radius * s.radius * s.radius;
   else
@@ -280,13 +278,13 @@ var
 begin
   Result := m3_identity;
   case s.kind of
-    SHAPE_SPHERE:
+    SK_SPHERE:
       begin
         r2 := 0.4 * mass * s.radius * s.radius;
         Result.m[0] := r2; Result.m[4] := r2; Result.m[8] := r2;
       end;
 
-    SHAPE_BOX:
+    SK_BOX:
       begin
         h := v3_mul(s.half, 2.0);
         ix := mass * (h.y * h.y + h.z * h.z) / 12.0;
@@ -295,7 +293,7 @@ begin
         Result.m[0] := ix; Result.m[4] := iy; Result.m[8] := iz;
       end;
 
-    SHAPE_CAPSULE:
+    SK_CAPSULE:
       begin
         { Приближаем цилиндром той же массы -- погрешность в пределах 10%. }
         ix := mass * (3.0 * s.radius * s.radius +
@@ -304,7 +302,7 @@ begin
         Result.m[0] := ix; Result.m[4] := iy; Result.m[8] := ix;
       end;
 
-    SHAPE_HULL:
+    SK_HULL:
       begin
         b := aabb_empty;
         for i := 0 to s.npts - 1 do aabb_add(b, s.pts[i]);
@@ -641,6 +639,8 @@ begin
   Result := False;
   if simp.n < 4 then Exit;
 
+  nedges := 0;
+  FillChar(edges, SizeOf(edges), 0);
   nverts := 4;
   for i := 0 to 3 do verts[i] := simp.w[i];
 
