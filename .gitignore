@@ -1,0 +1,7 @@
+build/
+bin/
+devlog/
+*.o
+*.ppu
+*.compiled
+*.bak

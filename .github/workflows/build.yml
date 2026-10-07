@@ -1,20 +1,72 @@
 name: build
 
+# The CI job compiles every unit, builds the examples and runs the test
+# suite.  Build output is committed back into devlog/ so that compiler and
+# test output can be inspected without downloading job logs through the
+# web UI (handy when only the API is available).  devlog/ is ignored by
+# git but force-added here on purpose.
+
 on:
   push:
-    branches: [ "**" ]
+    branches: ["**"]
+    paths-ignore:
+      - "devlog/**"
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install Free Pascal
+
+      - name: Install toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq fpc >/dev/null
-      - name: Show compiler
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            fpc libsdl2-dev imagemagick python3 >/dev/null
+
+      - name: Build
         run: |
-          fpc -iV
-          ls /usr/lib/fpc/*/units/*/rtl/ 2>/dev/null | head
+          mkdir -p devlog
+          {
+            echo "=== hdeh build report ==================================="
+            echo "date    : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "host    : $(uname -srm)"
+            echo "fpc     : $(fpc -iV)"
+            echo "target  : $(fpc -iTO)"
+            echo
+          } > devlog/report.txt
+          make -k units     >> devlog/report.txt 2>&1; echo "make units   exit=$?" >> devlog/report.txt
+          make -k examples  >> devlog/report.txt 2>&1; echo "make examples exit=$?" >> devlog/report.txt
+          make -k tests     >> devlog/report.txt 2>&1; echo "make tests    exit=$?" >> devlog/report.txt
+          echo "== running unit tests ==" >> devlog/report.txt
+          if [ -x bin/hdeh_tests ]; then
+            bin/hdeh_tests >> devlog/report.txt 2>&1
+            echo "hdeh_tests exit=$?" >> devlog/report.txt
+          else
+            echo "hdeh_tests: not built" >> devlog/report.txt
+          fi
+
+      - name: Collect render output
+        if: always()
+        run: bash scripts/ci_collect.sh 2>&1 | tail -40
+
+      - name: Report back
+        if: always()
+        run: |
+          git config user.name  "hdeh-ci"
+          git config user.email "ci@users.noreply.github.com"
+          git add -Af devlog
+          if git diff --cached --quiet; then
+            echo "nothing to report"
+          else
+            git commit -q -m "ci: build report [skip ci]"
+            git push -q origin HEAD:${{ github.ref_name }}
+          fi
