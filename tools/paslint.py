@@ -17,7 +17,9 @@ import os
 import re
 import sys
 
-KEYWORDS_OPEN = {"begin", "repeat", "case", "try", "record", "asm", "object"}
+KEYWORDS_OPEN = {"begin", "repeat", "case", "try", "record", "asm"}
+# "class" and "object" only open a block after a type declaration: T = class
+TYPE_OPEN = {"class", "object"}
 KEYWORDS_CLOSE = {"end", "until"}
 
 
@@ -102,7 +104,30 @@ def check(path: str) -> list:
     depth = 1 if re.match(r"\s*(unit|library)\b", clean, re.IGNORECASE) else 0
     paren = 0
     prev = None
-    for ln, tok in tokens:
+    for idx, (ln, tok) in enumerate(tokens):
+        if tok in TYPE_OPEN:
+            # "TFoo = class" opens a block; "TFoo = class(Base);" and
+            # "TFoo = class;" are declarations without a body, and
+            # "class procedure" is a modifier rather than a block
+            if prev == "=":
+                j = idx + 1
+                if j < len(tokens) and tokens[j][1] == "(":
+                    lvl = 0
+                    while j < len(tokens):
+                        if tokens[j][1] == "(":
+                            lvl += 1
+                        elif tokens[j][1] == ")":
+                            lvl -= 1
+                            if lvl == 0:
+                                j += 1
+                                break
+                        j += 1
+                if j < len(tokens) and tokens[j][1] == ";":
+                    pass          # declaration only
+                else:
+                    depth += 1
+            prev = tok
+            continue
         if tok == "(":
             paren += 1
         elif tok == ")":

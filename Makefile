@@ -36,15 +36,15 @@ CORE_UNITS = \
 DEMOS = $(BIN)/demo_terminal $(BIN)/demo_sdl
 TESTS_BIN = $(BIN)/hdeh_tests
 
-.PHONY: all core examples tests run run-sdl test clean units check
+.PHONY: all dirs core examples tests run run-sdl test clean units
 
 all: core examples tests
 
-$(UNITS) $(BIN):
-	@mkdir -p $@
+dirs:
+	@mkdir -p $(BIN) $(UNITS)
 
 # --- compile every unit on its own: catches errors even if nothing uses it --
-units: | $(UNITS)
+units: dirs
 	@fail=0; for u in $(CORE_UNITS); do \
 		if [ -f "$$u" ]; then \
 			echo "== fpc $$u"; \
@@ -54,11 +54,11 @@ units: | $(UNITS)
 
 core: units
 
-examples: | $(BIN) $(UNITS)
+examples: dirs
 	$(FPC) $(COMMON) $(EXAMPLES)/demo_terminal.lpr -o$(BIN)/demo_terminal
 	$(FPC) $(COMMON) $(EXAMPLES)/demo_sdl.lpr -o$(BIN)/demo_sdl
 
-tests: | $(BIN) $(UNITS)
+tests: dirs
 	$(FPC) $(COMMON) $(TESTS)/hdeh_tests.lpr -o$(TESTS_BIN)
 
 run: $(BIN)/demo_terminal
