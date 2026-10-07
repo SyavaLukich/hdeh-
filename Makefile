@@ -11,8 +11,9 @@ FPC      ?= fpc
 OUT      ?= build
 BIN      := $(OUT)/engine3d
 TESTBIN  := $(OUT)/test_physics
+RTESTBIN := $(OUT)/test_render
+PREVBIN  := $(OUT)/render_preview
 SRC      := src/main.pas
-TESTSRC  := tests/test_physics.pas
 
 # Если указан RTL -- добавляем пути к модулям RTL вручную
 # (нужно, когда компилятор запускается не из установленного окружения).
@@ -40,10 +41,24 @@ portable: dirs
 debug: dirs
 	$(FPC) $(DBGFLAGS) -oengine3d $(SRC)
 
-# Тесты математики, GJK/EPA и решателя. OpenGL и GLFW не нужны.
-test: dirs
-	$(FPC) -O3 $(RTLFLAGS) -Fusrc -FU$(OUT)/tunits -FE$(OUT) -otest_physics $(TESTSRC)
+# Тесты. Ни OpenGL, ни GLFW, ни дисплей для них не нужны.
+test: test-physics test-render
+
+test-physics: dirs
+	$(FPC) -O3 $(RTLFLAGS) -Fusrc -FU$(OUT)/tunits -FE$(OUT) -otest_physics tests/test_physics.pas
 	./$(TESTBIN)
+
+test-render: dirs
+	$(FPC) -O3 $(RTLFLAGS) -Fusrc -FU$(OUT)/tunits -FE$(OUT) -otest_render tests/test_render.pas
+	./$(RTESTBIN)
+
+# Кадр, нарисованный программным растеризатором: та же сцена, та же камера
+# и та же модель освещения, что и в шейдерах, но без видеокарты.
+preview: dirs
+	$(FPC) -O3 $(RTLFLAGS) -Fusrc -FU$(OUT)/tunits -FE$(OUT) -orender_preview tests/render_preview.pas
+	./$(PREVBIN)
+	@python3 tools/bmp2png.py $(OUT)/preview.bmp $(OUT)/preview.png 2>/dev/null \
+	  && echo "также сохранено: $(OUT)/preview.png" || true
 
 dirs:
 	@mkdir -p $(OUT)/units $(OUT)/tunits
@@ -54,4 +69,4 @@ run: all
 clean:
 	rm -rf $(OUT)
 
-.PHONY: all portable debug test dirs run clean
+.PHONY: all portable debug test test-physics test-render preview dirs run clean

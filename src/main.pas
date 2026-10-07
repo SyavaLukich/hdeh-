@@ -23,7 +23,7 @@ program main;
 {$H+}
 
 uses
-  SysUtils, umath, uglfw, ugl, umesh, urender, ugjk, uphysics;
+  SysUtils, umath, uglfw, ugl, ugeom, ucamera, umesh, urender, ugjk, uphysics;
 
 const
   WIN_W = 1280;

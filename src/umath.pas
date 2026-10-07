@@ -76,6 +76,7 @@ type
 
 { ---------------------------------------------------------------- векторы }
 function  v3(const ax, ay, az: Single): TVec3; inline;
+function  v4_make(const ax, ay, az, aw: Single): TVec4; inline;
 function  v3_zero: TVec3; inline;
 function  v3_add(const a, b: TVec3): TVec3; inline;
 function  v3_sub(const a, b: TVec3): TVec3; inline;
@@ -173,6 +174,11 @@ uses
 function v3(const ax, ay, az: Single): TVec3;
 begin
   Result.x := ax; Result.y := ay; Result.z := az;
+end;
+
+function v4_make(const ax, ay, az, aw: Single): TVec4;
+begin
+  Result.x := ax; Result.y := ay; Result.z := az; Result.w := aw;
 end;
 
 function v3_zero: TVec3;
