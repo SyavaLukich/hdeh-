@@ -1,5 +1,5 @@
 === hdeh build report ===================================
-date    : 2026-10-07T19:40:17Z
+date    : 2026-10-07T19:43:21Z
 host    : Linux 6.8.0-1064-azure x86_64
 fpc     : 3.2.2
 target  : linux
@@ -7,6 +7,50 @@ target  : linux
 == fpc src/hdeh_math.pas
 Free Pascal Compiler version 3.2.2+dfsg-9ubuntu1 [2022/04/11] for x86_64
 Copyright (c) 1993-2021 by Florian Klaempfl and others
-Error: Path "bin/" does not exist
+Target OS: Linux for x86-64
+Compiling src/hdeh_math.pas
+hdeh_math.pas(638,16) Error: No default property available
+hdeh_math.pas(638,16) Fatal: Syntax error, ";" expected but "[" found
+Fatal: Compilation aborted
+Error: /usr/bin/ppcx64 returned an error exitcode
+== fpc src/hdeh_image.pas
+Free Pascal Compiler version 3.2.2+dfsg-9ubuntu1 [2022/04/11] for x86_64
+Copyright (c) 1993-2021 by Florian Klaempfl and others
+Target OS: Linux for x86-64
+Compiling src/hdeh_image.pas
+Compiling src/hdeh_math.pas
+hdeh_math.pas(638,16) Error: No default property available
+hdeh_math.pas(638,16) Fatal: Syntax error, ";" expected but "[" found
+Fatal: Compilation aborted
+Error: /usr/bin/ppcx64 returned an error exitcode
+== fpc src/hdeh_mesh.pas
+Free Pascal Compiler version 3.2.2+dfsg-9ubuntu1 [2022/04/11] for x86_64
+Copyright (c) 1993-2021 by Florian Klaempfl and others
+Target OS: Linux for x86-64
+Compiling src/hdeh_mesh.pas
+Compiling src/hdeh_math.pas
+hdeh_math.pas(638,16) Error: No default property available
+hdeh_math.pas(638,16) Fatal: Syntax error, ";" expected but "[" found
+Fatal: Compilation aborted
+Error: /usr/bin/ppcx64 returned an error exitcode
+== fpc src/hdeh_scene.pas
+Free Pascal Compiler version 3.2.2+dfsg-9ubuntu1 [2022/04/11] for x86_64
+Copyright (c) 1993-2021 by Florian Klaempfl and others
+Target OS: Linux for x86-64
+Compiling src/hdeh_scene.pas
+Compiling src/hdeh_math.pas
+hdeh_math.pas(638,16) Error: No default property available
+hdeh_math.pas(638,16) Fatal: Syntax error, ";" expected but "[" found
+Fatal: Compilation aborted
+Error: /usr/bin/ppcx64 returned an error exitcode
+== fpc src/hdeh_raster.pas
+Free Pascal Compiler version 3.2.2+dfsg-9ubuntu1 [2022/04/11] for x86_64
+Copyright (c) 1993-2021 by Florian Klaempfl and others
+Target OS: Linux for x86-64
+Compiling src/hdeh_raster.pas
+Compiling src/hdeh_math.pas
+hdeh_math.pas(638,16) Error: No default property available
+hdeh_math.pas(638,16) Fatal: Syntax error, ";" expected but "[" found
+Fatal: Compilation aborted
 Error: /usr/bin/ppcx64 returned an error exitcode
 make: *** [Makefile:48: units] Error 1
