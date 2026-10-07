@@ -110,11 +110,16 @@ begin
                           Pointer(ofs));
     glVertexAttribDivisor(3 + i, 1);
   end;
-  { Цвет экземпляра -- слот 7. }
+  { Цвет экземпляра -- слот 7, параметры материала -- слот 8. }
   glEnableVertexAttribArray(7);
   glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE, SizeOf(TInstance),
                         Pointer(64));
   glVertexAttribDivisor(7, 1);
+
+  glEnableVertexAttribArray(8);
+  glVertexAttribPointer(8, 4, GL_FLOAT, GL_FALSE, SizeOf(TInstance),
+                        Pointer(80));
+  glVertexAttribDivisor(8, 1);
 
   glBindVertexArray(0);
 end;

@@ -114,6 +114,26 @@ function  m4_lookat(const eye, target, up: TVec3): TMat4;
 function  m4_transform_point(const m: TMat4; const p: TVec3): TVec3; inline;
 function  m4_transform_dir(const m: TMat4; const v: TVec3): TVec3; inline;
 function  m4_inverse_affine(const m: TMat4): TMat4;
+{ Полная инверсия 4x4. Нужна там, где матрица НЕ аффинная -- например,
+  обратная матрица вида-проекции для восстановления мировой позиции из
+  буфера глубины. Для аффинных матриц дешевле m4_inverse_affine. }
+function  m4_inverse(const m: TMat4): TMat4;
+
+{ --- сферические гармоники второго порядка ---
+  Девять цветных коэффициентов полностью описывают мягкую засветку от
+  окружения. В Fox Engine это называется irradiance spherical map: сцена
+  запекается в такие коэффициенты и читается шейдером на лету. }
+type
+  TSH9 = array[0..8] of TVec3;
+
+{ Базисные функции в точке на сфере. }
+procedure sh_basis(const d: TVec3; out b: array of Single);
+{ Накопить вклад направления в разложение. }
+procedure sh_add(var sh: TSH9; const d, color: TVec3; weight: Single);
+procedure sh_clear(out sh: TSH9);
+{ Облучённость (ватт на кв. метр) для нормали n. Для ламбертовой
+  поверхности яркость = альбедо * sh_irradiance / PI. }
+function  sh_irradiance(const sh: TSH9; const n: TVec3): TVec3;
 function  m4_transpose(const m: TMat4): TMat4;
 function  m4_normal_matrix(const m: TMat4): TMat3;
 
@@ -482,6 +502,107 @@ begin
   Result.x := m.m[0] * v.x + m.m[4] * v.y + m.m[8]  * v.z;
   Result.y := m.m[1] * v.x + m.m[5] * v.y + m.m[9]  * v.z;
   Result.z := m.m[2] * v.x + m.m[6] * v.y + m.m[10] * v.z;
+end;
+
+function m4_inverse(const m: TMat4): TMat4;
+var
+  a: array[0..15] of Single;
+  inv: array[0..15] of Single;
+  det: Single;
+  i: Integer;
+begin
+  for i := 0 to 15 do a[i] := m.m[i];
+
+  inv[0] :=  a[5]*a[10]*a[15] - a[5]*a[11]*a[14] - a[9]*a[6]*a[15]
+           + a[9]*a[7]*a[14] + a[13]*a[6]*a[11] - a[13]*a[7]*a[10];
+  inv[4] := -a[4]*a[10]*a[15] + a[4]*a[11]*a[14] + a[8]*a[6]*a[15]
+           - a[8]*a[7]*a[14] - a[12]*a[6]*a[11] + a[12]*a[7]*a[10];
+  inv[8] :=  a[4]*a[9]*a[15] - a[4]*a[11]*a[13] - a[8]*a[5]*a[15]
+           + a[8]*a[7]*a[13] + a[12]*a[5]*a[11] - a[12]*a[7]*a[9];
+  inv[12]:= -a[4]*a[9]*a[14] + a[4]*a[10]*a[13] + a[8]*a[5]*a[14]
+           - a[8]*a[6]*a[13] - a[12]*a[5]*a[10] + a[12]*a[6]*a[9];
+  inv[1] := -a[1]*a[10]*a[15] + a[1]*a[11]*a[14] + a[9]*a[2]*a[15]
+           - a[9]*a[3]*a[14] - a[13]*a[2]*a[11] + a[13]*a[3]*a[10];
+  inv[5] :=  a[0]*a[10]*a[15] - a[0]*a[11]*a[14] - a[8]*a[2]*a[15]
+           + a[8]*a[3]*a[14] + a[12]*a[2]*a[11] - a[12]*a[3]*a[10];
+  inv[9] := -a[0]*a[9]*a[15] + a[0]*a[11]*a[13] + a[8]*a[1]*a[15]
+           - a[8]*a[3]*a[13] - a[12]*a[1]*a[11] + a[12]*a[3]*a[9];
+  inv[13]:=  a[0]*a[9]*a[14] - a[0]*a[10]*a[13] - a[8]*a[1]*a[14]
+           + a[8]*a[2]*a[13] + a[12]*a[1]*a[10] - a[12]*a[2]*a[9];
+  inv[2] :=  a[1]*a[6]*a[15] - a[1]*a[7]*a[14] - a[5]*a[2]*a[15]
+           + a[5]*a[3]*a[14] + a[13]*a[2]*a[7] - a[13]*a[3]*a[6];
+  inv[6] := -a[0]*a[6]*a[15] + a[0]*a[7]*a[14] + a[4]*a[2]*a[15]
+           - a[4]*a[3]*a[14] - a[12]*a[2]*a[7] + a[12]*a[3]*a[6];
+  inv[10]:=  a[0]*a[5]*a[15] - a[0]*a[7]*a[13] - a[4]*a[1]*a[15]
+           + a[4]*a[3]*a[13] + a[12]*a[1]*a[7] - a[12]*a[3]*a[5];
+  inv[14]:= -a[0]*a[5]*a[14] + a[0]*a[6]*a[13] + a[4]*a[1]*a[14]
+           - a[4]*a[2]*a[13] - a[12]*a[1]*a[6] + a[12]*a[2]*a[5];
+  inv[3] := -a[1]*a[6]*a[11] + a[1]*a[7]*a[10] + a[5]*a[2]*a[11]
+           - a[5]*a[3]*a[10] - a[9]*a[2]*a[7] + a[9]*a[3]*a[6];
+  inv[7] :=  a[0]*a[6]*a[11] - a[0]*a[7]*a[10] - a[4]*a[2]*a[11]
+           + a[4]*a[3]*a[10] + a[8]*a[2]*a[7] - a[8]*a[3]*a[6];
+  inv[11]:= -a[0]*a[5]*a[11] + a[0]*a[7]*a[9] + a[4]*a[1]*a[11]
+           - a[4]*a[3]*a[9] - a[8]*a[1]*a[7] + a[8]*a[3]*a[5];
+  inv[15]:=  a[0]*a[5]*a[10] - a[0]*a[6]*a[9] - a[4]*a[1]*a[10]
+           + a[4]*a[2]*a[9] + a[8]*a[1]*a[6] - a[8]*a[2]*a[5];
+
+  det := a[0]*inv[0] + a[1]*inv[4] + a[2]*inv[8] + a[3]*inv[12];
+  if Abs(det) < 1.0e-20 then
+  begin
+    Result := m4_identity;
+    Exit;
+  end;
+  det := 1.0 / det;
+  for i := 0 to 15 do Result.m[i] := inv[i] * det;
+end;
+
+procedure sh_basis(const d: TVec3; out b: array of Single);
+begin
+  b[0] := 0.282095;
+  b[1] := 0.488603 * d.y;
+  b[2] := 0.488603 * d.z;
+  b[3] := 0.488603 * d.x;
+  b[4] := 1.092548 * d.x * d.y;
+  b[5] := 1.092548 * d.y * d.z;
+  b[6] := 0.315392 * (3.0 * d.z * d.z - 1.0);
+  b[7] := 1.092548 * d.x * d.z;
+  b[8] := 0.546274 * (d.x * d.x - d.y * d.y);
+end;
+
+procedure sh_clear(out sh: TSH9);
+var i: Integer;
+begin
+  for i := 0 to 8 do sh[i] := v3_zero;
+end;
+
+procedure sh_add(var sh: TSH9; const d, color: TVec3; weight: Single);
+var
+  b: array[0..8] of Single;
+  i: Integer;
+begin
+  sh_basis(d, b);
+  for i := 0 to 8 do
+    sh[i] := v3_add(sh[i], v3_mul(color, b[i] * weight));
+end;
+
+function sh_irradiance(const sh: TSH9; const n: TVec3): TVec3;
+const
+  { свёртка с косинусным ядром: A0 = pi, A1 = 2pi/3, A2 = pi/4 }
+  A0 = 3.14159265;
+  A1 = 2.09439510;
+  A2 = 0.78539816;
+var
+  e: TVec3;
+begin
+  e := v3_mul(sh[0], A0 * 0.282095);
+  e := v3_add(e, v3_mul(v3_add(v3_add(v3_mul(sh[1], n.y), v3_mul(sh[2], n.z)),
+                               v3_mul(sh[3], n.x)), A1 * 0.488603));
+  e := v3_add(e, v3_mul(v3_add(v3_add(v3_mul(sh[4], n.x * n.y),
+                                      v3_mul(sh[5], n.y * n.z)),
+                               v3_mul(sh[7], n.x * n.z)), A2 * 1.092548));
+  e := v3_add(e, v3_mul(sh[6], A2 * 0.315392 * (3.0 * n.z * n.z - 1.0)));
+  e := v3_add(e, v3_mul(sh[8], A2 * 0.546274 * (n.x * n.x - n.y * n.y)));
+  Result := v3_max(e, v3_zero);
 end;
 
 function m4_transpose(const m: TMat4): TMat4;

@@ -34,6 +34,7 @@ type
   GLsync     = Pointer;
   GLuint64   = QWord;
 
+  PGLenum  = ^GLenum;
   PGLuint  = ^GLuint;
   PGLint   = ^GLint;
   PGLfloat = ^GLfloat;
@@ -60,6 +61,24 @@ const
   GL_DEPTH_ATTACHMENT     = $8D00;
   GL_FRAMEBUFFER_COMPLETE = $8CD5;
   GL_DEPTH_COMPONENT24    = $81A6;
+  GL_DEPTH_COMPONENT      = $1902;
+  GL_DEPTH_COMPONENT32F   = $8CAC;
+  GL_COLOR_ATTACHMENT1    = $8CE1;
+  GL_COLOR_ATTACHMENT2    = $8CE2;
+  GL_COLOR_ATTACHMENT3    = $8CE3;
+  GL_RGBA16F              = $881A;
+  GL_RGB16F               = $881B;
+  GL_RG16F                = $822F;
+  GL_R16F                 = $822D;
+  GL_R11F_G11F_B10F       = $8C3A;
+  GL_RG                   = $8227;
+  GL_RED                  = $1903;
+  GL_HALF_FLOAT           = $140B;
+  GL_CLAMP_TO_BORDER      = $812D;
+  GL_TEXTURE_BORDER_COLOR = $1004;
+  GL_TEXTURE_COMPARE_MODE = $884C;
+  GL_TEXTURE_COMPARE_FUNC = $884D;
+  GL_COMPARE_REF_TO_TEXTURE = $884E;
 
   GL_NEVER    = $0200;
   GL_LESS     = $0201;
@@ -178,6 +197,13 @@ var
   glFramebufferRenderbuffer: procedure(target, attachment, rbtarget: GLenum;
                                        rb: GLuint); cdecl;
   glCheckFramebufferStatus:  function(target: GLenum): GLenum; cdecl;
+  glFramebufferTexture2D: procedure(target, attachment, textarget: GLenum;
+                                    tex: GLuint; level: GLint); cdecl;
+  glDrawBuffers:   procedure(n: GLsizei; const bufs: PGLenum); cdecl;
+  glTexParameterfv:procedure(target, pname: GLenum; const params: PGLfloat); cdecl;
+  glColorMask:     procedure(r, g, b, a: GLboolean); cdecl;
+  glBlitFramebuffer: procedure(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1: GLint;
+                               mask: GLbitfield; filter: GLenum); cdecl;
 
   { ---- буферы ---- }
   glGenBuffers:    procedure(n: GLsizei; buffers: PGLuint); cdecl;
@@ -312,6 +338,11 @@ begin
   Pointer(glRenderbufferStorage)     := get_proc('glRenderbufferStorage');
   Pointer(glFramebufferRenderbuffer) := get_proc('glFramebufferRenderbuffer');
   Pointer(glCheckFramebufferStatus)  := get_proc('glCheckFramebufferStatus');
+  Pointer(glFramebufferTexture2D)    := get_proc('glFramebufferTexture2D');
+  Pointer(glDrawBuffers)             := get_proc('glDrawBuffers');
+  Pointer(glTexParameterfv)          := get_proc('glTexParameterfv');
+  Pointer(glColorMask)               := get_proc('glColorMask');
+  Pointer(glBlitFramebuffer)         := get_proc('glBlitFramebuffer');
   Pointer(glDrawArraysInstanced)   := get_proc('glDrawArraysInstanced');
 
   Pointer(glGenBuffers)    := get_proc('glGenBuffers');

@@ -80,6 +80,20 @@ test-raster: dirs
 	$(FPC) -O3 $(RTLFLAGS) -Fusrc -Futests -FU$(OUT)/tunits -FE$(OUT) -otest_raster tests/test_raster.pas
 	./$(XTESTBIN)
 
+# Кадр через отложенный конвейер ufox (настоящий OpenGL, см. docs/headless-gl.md).
+render-fox: dirs
+	$(FPC) -O2 $(RTLFLAGS) $(if $(MESA),-Fl$(MESA)/lib/x86_64-linux-gnu) \
+	  $(if $(GLFWLIB),-Fl$(GLFWLIB)) \
+	  -Fusrc -Futests -FU$(OUT)/tunits -FE$(OUT) -orender_fox tests/render_fox.pas
+	$(if $(MESA),LD_LIBRARY_PATH=$(MESA)/lib/x86_64-linux-gnu:$(GLFWLIB)) \
+	  EGL_PLATFORM=surfaceless ./$(OUT)/render_fox
+	@python3 tools/bmp2png.py $(OUT)/fox.bmp $(OUT)/fox.png 2>/dev/null \
+	  && echo "также сохранено: $(OUT)/fox.png" || true
+
+# Проверка всех шейдеров компилятором GLSL от Khronos (если он установлен).
+check-shaders:
+	python3 tools/check_shaders.py
+
 # Безэкранный прогон НАСТОЯЩЕГО OpenGL: контекст создаётся через EGL на
 # платформе surfaceless, драйвером может быть программная Mesa (softpipe).
 # Нужны libEGL и заголовки не нужны -- всё грузится динамически.
@@ -116,4 +130,4 @@ run: all
 clean:
 	rm -rf $(OUT)
 
-.PHONY: all portable debug test test-physics test-render test-raster test-anim preview render-gl render-ragdoll render-ragdoll-gl compare dirs run clean
+.PHONY: all portable debug test test-physics test-render test-raster test-anim preview render-gl render-fox check-shaders render-ragdoll render-ragdoll-gl compare dirs run clean

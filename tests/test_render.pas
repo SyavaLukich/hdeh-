@@ -66,10 +66,11 @@ begin
   check(PtrUInt(@v.nx) - base = 12, 'смещение нормали = 12');
   check(PtrUInt(@v.u)  - base = 24, 'смещение UV = 24');
 
-  check(SizeOf(TInstance) = 80, 'экземпляр занимает 80 байт');
+  check(SizeOf(TInstance) = 96, 'экземпляр занимает 96 байт');
   base := PtrUInt(@inst);
   check(PtrUInt(@inst.model) - base = 0,  'смещение матрицы = 0');
   check(PtrUInt(@inst.color) - base = 64, 'смещение цвета = 64');
+  check(PtrUInt(@inst.material) - base = 80, 'смещение материала = 80');
 
   check(SizeOf(TMat4) = 64, 'матрица 4x4 занимает 64 байта');
   check(SizeOf(TVec3) = 12, 'вектор занимает 12 байт');
@@ -277,11 +278,102 @@ begin
   check(c.pitch < PI_F * 0.5, 'наклон камеры ограничен');
 end;
 
+{ ================================ математика отложенного конвейера }
+procedure test_deferred_math;
+var
+  p, v, vp, inv, id: TMat4;
+  i, n: Integer;
+  err, u1, z, r, phi: Single;
+  sh: TSH9;
+  d, e, world, back: TVec3;
+  clip: array[0..3] of Single;
+  w: Single;
+begin
+  WriteLn('-- математика отложенного конвейера');
+
+  { --- полная инверсия 4x4 ---
+    Для восстановления мировой позиции из буфера глубины нужна обратная
+    матрица вида-проекции, а она НЕ аффинная: m4_inverse_affine здесь
+    молча даёт мусор. }
+  p := m4_perspective(45 * DEG2RAD, 16 / 9, 0.1, 160);
+  v := m4_lookat(v3(7.6, 2.05, 8.6), v3(0, 1, 0), v3(0, 1, 0));
+  vp := m4_mul(p, v);
+  inv := m4_inverse(vp);
+  id := m4_mul(vp, inv);
+  err := 0;
+  for i := 0 to 15 do
+    if (i mod 5) = 0 then err := fmax(err, Abs(id.m[i] - 1.0))
+    else err := fmax(err, Abs(id.m[i]));
+  check(err < 1e-4, Format('vp * inv(vp) = E (ошибка %.6f)', [err]));
+
+  { туда-обратно через однородные координаты }
+  world := v3(3, 0.5, -2);
+  for i := 0 to 3 do
+    clip[i] := vp.m[i] * world.x + vp.m[4 + i] * world.y +
+               vp.m[8 + i] * world.z + vp.m[12 + i];
+  for i := 0 to 2 do clip[i] := clip[i] / clip[3];
+  w := inv.m[3] * clip[0] + inv.m[7] * clip[1] + inv.m[11] * clip[2] + inv.m[15];
+  back := v3((inv.m[0]*clip[0] + inv.m[4]*clip[1] + inv.m[8]*clip[2] + inv.m[12]) / w,
+             (inv.m[1]*clip[0] + inv.m[5]*clip[1] + inv.m[9]*clip[2] + inv.m[13]) / w,
+             (inv.m[2]*clip[0] + inv.m[6]*clip[1] + inv.m[10]*clip[2] + inv.m[14]) / w);
+  check_near(v3_dist(back, world), 0, 1e-3,
+             'мир -> экран -> мир через полную инверсию');
+
+  { аффинная инверсия на той же матрице обязана ошибиться -- иначе
+    проверка выше ничего не доказывает }
+  inv := m4_inverse_affine(vp);
+  w := inv.m[3]*clip[0] + inv.m[7]*clip[1] + inv.m[11]*clip[2] + inv.m[15];
+  if Abs(w) < 1e-9 then w := 1e-9;
+  back := v3((inv.m[0]*clip[0] + inv.m[4]*clip[1] + inv.m[8]*clip[2] + inv.m[12]) / w,
+             (inv.m[1]*clip[0] + inv.m[5]*clip[1] + inv.m[9]*clip[2] + inv.m[13]) / w,
+             (inv.m[2]*clip[0] + inv.m[6]*clip[1] + inv.m[10]*clip[2] + inv.m[14]) / w);
+  check(v3_dist(back, world) > 0.5,
+        'аффинная инверсия на перспективе даёт мусор -- проверка не пустая');
+
+  { --- сферические гармоники ---
+    Равномерное белое небо яркости 1 даёт облучённость ровно pi
+    в любом направлении. }
+  sh_clear(sh);
+  n := 4096;
+  for i := 0 to n - 1 do
+  begin
+    u1 := (i + 0.5) / n;
+    z := 1.0 - 2.0 * u1;
+    r := Sqrt(fmax(0.0, 1.0 - z * z));
+    phi := i * 2.39996323;
+    d := v3(r * Cos(phi), z, r * Sin(phi));
+    sh_add(sh, d, v3(1, 1, 1), 1.0);
+  end;
+  for i := 0 to 8 do sh[i] := v3_mul(sh[i], 4.0 * PI_F / n);
+
+  e := sh_irradiance(sh, v3(0, 1, 0));
+  check_near(e.x, PI_F, 0.02, 'ровное небо: облучённость сверху = pi');
+  e := sh_irradiance(sh, v3_norm(v3(1, -0.3, 0.5)));
+  check_near(e.x, PI_F, 0.02, 'ровное небо: облучённость сбоку тоже pi');
+
+  { Небо только сверху: снизу облучённость обязана быть заметно меньше. }
+  sh_clear(sh);
+  for i := 0 to n - 1 do
+  begin
+    u1 := (i + 0.5) / n;
+    z := 1.0 - 2.0 * u1;
+    r := Sqrt(fmax(0.0, 1.0 - z * z));
+    phi := i * 2.39996323;
+    d := v3(r * Cos(phi), z, r * Sin(phi));
+    if d.y > 0 then sh_add(sh, d, v3(1, 1, 1), 1.0);
+  end;
+  for i := 0 to 8 do sh[i] := v3_mul(sh[i], 4.0 * PI_F / n);
+  check(sh_irradiance(sh, v3(0, 1, 0)).x >
+        sh_irradiance(sh, v3(0, -1, 0)).x * 3.0,
+        'свет только сверху: вверх светит сильно ярче, чем вниз');
+end;
+
 begin
   WriteLn('=== тесты визуальной части ===');
   test_layout;
   test_geometry;
   test_camera;
+  test_deferred_math;
   WriteLn;
   WriteLn(Format('итого: %d пройдено, %d провалено', [g_pass, g_fail]));
   if g_fail > 0 then Halt(1);
