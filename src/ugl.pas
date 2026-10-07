@@ -116,7 +116,8 @@ const
   GL_VENDOR     = $1F00;
   GL_RENDERER   = $1F01;
   GL_VERSION    = $1F02;
-  GL_EXTENSIONS = $1F03;
+  GL_EXTENSIONS           = $1F03;
+  GL_NUM_EXTENSIONS       = $821D;
   GL_SHADING_LANGUAGE_VERSION = $8B8C;
 
   GL_ARRAY_BUFFER         = $8892;
@@ -170,6 +171,7 @@ var
   glPolygonOffset:procedure(factor, units: GLfloat); cdecl;
   glGetError:     function: GLenum; cdecl;
   glGetString:    function(name: GLenum): PChar; cdecl;
+  glGetStringi:   function(name: GLenum; index: GLuint): PChar; cdecl;
   glGetIntegerv:  procedure(pname: GLenum; data: PGLint); cdecl;
   glLineWidth:    procedure(w: GLfloat); cdecl;
 
@@ -275,8 +277,14 @@ function gl_load: Boolean;
 { Загрузка через произвольный поставщик адресов (headless-проверки). }
 function gl_load_with(getproc: TGLGetProcAddress): Boolean;
 function gl_check(const tag: string): Boolean;
+{ Есть ли расширение в текущем контексте. Так возможности OpenGL 4.x
+  используются на контексте 3.3: драйверы отдают их как ARB-расширения. }
+function gl_has_extension(const name: string): Boolean;
 
 implementation
+
+uses
+  SysUtils;
 
 var
   g_missing: Integer = 0;
@@ -302,6 +310,25 @@ begin
   Result := gl_load_with(@glfw_getproc);
 end;
 
+function gl_has_extension(const name: string): Boolean;
+var
+  n, i: GLint;
+  s: PChar;
+begin
+  Result := False;
+  if not Assigned(glGetStringi) then Exit;
+  glGetIntegerv(GL_NUM_EXTENSIONS, @n);
+  for i := 0 to n - 1 do
+  begin
+    s := glGetStringi(GL_EXTENSIONS, i);
+    if (s <> nil) and (StrComp(s, PChar(name)) = 0) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
 function gl_load_with(getproc: TGLGetProcAddress): Boolean;
 begin
   g_getproc := getproc;
@@ -321,6 +348,7 @@ begin
   Pointer(glPolygonOffset) := get_proc('glPolygonOffset');
   Pointer(glGetError)      := get_proc('glGetError');
   Pointer(glGetString)     := get_proc('glGetString');
+  Pointer(glGetStringi)    := get_proc('glGetStringi');
   Pointer(glGetIntegerv)   := get_proc('glGetIntegerv');
   Pointer(glLineWidth)     := get_proc('glLineWidth');
 

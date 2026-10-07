@@ -64,6 +64,15 @@ var
   fox_shadows   : Boolean = True;
   fox_ssao      : Boolean = True;
   fox_bloom     : Boolean = True;
+  { Отражения в экранном пространстве. Нужны буферы глубины и нормалей,
+    которые у отложенного конвейера уже есть. }
+  fox_ssr       : Boolean = True;
+  fox_ssr_rough : Single = 0.55;   { выше этой шероховатости не считаем }
+  { Включилась ли выборка 2x2 через textureGather (уровень OpenGL 4.0,
+    доступна расширением на контексте 3.3). }
+  fox_gather    : Boolean = False;
+  { Принудительно не использовать расширение -- для сравнения качества. }
+  fox_no_gather : Boolean = False;
   fox_fxaa      : Boolean = True;
   fox_bloom_thr : Single = 1.1;
   fox_bloom_mul : Single = 0.55;
@@ -292,6 +301,7 @@ const
     'uniform float uShadowOn;'                                       + #10 +
     'uniform float uAOOn;'                                           + #10 +
     'uniform float uDebug;'                                          + #10 +
+    'uniform float uShadowSize;'                                     + #10 +
     'const float PI = 3.14159265;'                                   + #10 +
     'vec3 gDbg = vec3(1.0, 0.0, 1.0);'                               + #10 +
     ''                                                               + #10 +
@@ -343,20 +353,47 @@ const
     '  return f0 * ab.x + ab.y;'                                     + #10 +
     '}'                                                              + #10 +
     ''                                                               + #10 +
+    '#ifdef USE_GATHER'                                              + #10 +
+    '// 16 выборок глубины за четыре обращения textureGather с'      + #10 +
+    '// правильными билинейными весами. textureGather -- это уровень' + #10 +
+    '// OpenGL 4.0, но на контексте 3.3 она доступна расширением'    + #10 +
+    '// GL_ARB_texture_gather, и движок включает её, если драйвер'   + #10 +
+    '// её отдаёт. Край тени получается заметно глаже.'              + #10 +
+    'float pcfGather(sampler2D sm, vec2 uv, float z) {'              + #10 +
+    '  float S = uShadowSize;'                                       + #10 +
+    '  float sum = 0.0;'                                             + #10 +
+    '  for (int y = -1; y <= 1; y += 2)'                             + #10 +
+    '  for (int x = -1; x <= 1; x += 2) {'                           + #10 +
+    '    vec2 tc = (uv + vec2(x, y) / S) * S - 0.5;'                 + #10 +
+    '    vec2 f = fract(tc);'                                        + #10 +
+    '    // Из расширения доступна форма БЕЗ номера компоненты --'   + #10 +
+    '    // третий аргумент появился только в GLSL 4.0. Для карты'    + #10 +
+    '    // глубины это и не нужно: берётся красный канал.'           + #10 +
+    '    vec4 g = textureGather(sm, (floor(tc) + 1.0) / S);'          + #10 +
+    '    vec4 lit = step(vec4(z), g);'                               + #10 +
+    '    sum += mix(mix(lit.w, lit.z, f.x), mix(lit.x, lit.y, f.x), f.y);' + #10 +
+    '  }'                                                            + #10 +
+    '  return sum * 0.25;'                                           + #10 +
+    '}'                                                              + #10 +
+    '#endif'                                                         + #10 +
     'float sampleCascade(sampler2D sm, mat4 lvp, vec3 P, float bias) {' + #10 +
     '  vec4 lc = lvp * vec4(P, 1.0);'                                + #10 +
     '  vec3 pc = lc.xyz / lc.w * 0.5 + 0.5;'                         + #10 +
 
     '  if (pc.x < 0.001 || pc.x > 0.999 || pc.y < 0.001 || pc.y > 0.999' + #10 +
     '      || pc.z > 1.0) return 1.0;'                               + #10 +
+    '#ifdef USE_GATHER'                                              + #10 +
+    '  return pcfGather(sm, pc.xy, pc.z - bias);'                    + #10 +
+    '#else'                                                          + #10 +
     '  float s = 0.0;'                                               + #10 +
-    '  float t = 1.0 / 1024.0;'                                      + #10 +
+    '  float t = 1.0 / uShadowSize;'                                 + #10 +
     '  for (int y = -1; y <= 1; ++y)'                                + #10 +
     '  for (int x = -1; x <= 1; ++x) {'                              + #10 +
     '    float d = texture(sm, pc.xy + vec2(x, y) * t).r;'           + #10 +
     '    s += (pc.z - bias > d) ? 0.0 : 1.0;'                        + #10 +
     '  }'                                                            + #10 +
     '  return s / 9.0;'                                              + #10 +
+    '#endif'                                                         + #10 +
     '}'                                                              + #10 +
     ''                                                               + #10 +
     'void main() {'                                                  + #10 +
@@ -449,6 +486,84 @@ const
     '  oColor = vec4(pow(t, vec3(1.0 / 2.2)), lum);'                 + #10 +
     '}' + #10;
 
+  { ---------------- отражения в экранном пространстве ----------------
+    Fox Engine считает SSR уже ПОСЛЕ тонмаппинга, в половинном разрешении
+    и всего по нескольку выборок на луч, а шум потом размывает. Делаем
+    так же: сначала грубый марш, потом двоичное уточнение попадания. }
+  FS_SSR =
+    '#version 330 core'                                              + #10 +
+    'in vec2 vUV; out vec4 oColor;'                                  + #10 +
+    'uniform sampler2D uScene, uDepth, uNormal, uMaterial;'          + #10 +
+    'uniform mat4 uViewProj, uInvViewProj;'                          + #10 +
+    'uniform vec3 uCamPos;'                                          + #10 +
+    'uniform vec2 uNearFar;'                                         + #10 +
+    'uniform float uMaxRough;'                                       + #10 +
+    'float linZ(float d) {'                                          + #10 +
+    '  float n = uNearFar.x, f = uNearFar.y;'                        + #10 +
+    '  float z = d * 2.0 - 1.0;'                                     + #10 +
+    '  return (2.0 * n * f) / (f + n - z * (f - n));'                + #10 +
+    '}'                                                              + #10 +
+    'vec3 worldFrom(vec2 uv, float d) {'                             + #10 +
+    '  vec4 c = uInvViewProj * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);' + #10 +
+    '  return c.xyz / c.w;'                                          + #10 +
+    '}'                                                              + #10 +
+    'void main() {'                                                  + #10 +
+    '  oColor = vec4(0.0);'                                          + #10 +
+    '  float d = texture(uDepth, vUV).r;'                            + #10 +
+    '  if (d >= 0.9999) return;'                                     + #10 +
+    '  float rough = texture(uMaterial, vUV).r;'                     + #10 +
+    '  if (rough > uMaxRough) return;'                               + #10 +
+    '  vec3 P = worldFrom(vUV, d);'                                  + #10 +
+    '  vec3 N = normalize(texture(uNormal, vUV).xyz);'               + #10 +
+    '  vec3 V = normalize(uCamPos - P);'                             + #10 +
+    '  vec3 R = reflect(-V, N);'                                     + #10 +
+    '  // луч, уходящий в камеру, отражать нечем'                    + #10 +
+    '  if (dot(R, V) > 0.35) return;'                                + #10 +
+    ''                                                               + #10 +
+    '  float step0 = 0.35;'                                          + #10 +
+    '  vec3 pos = P + N * 0.02;'                                     + #10 +
+    '  float hit = -1.0;'                                            + #10 +
+    '  vec2 hitUV = vec2(0.0);'                                      + #10 +
+    '  float t = 0.0;'                                               + #10 +
+    '  for (int i = 0; i < 20; ++i) {'                               + #10 +
+    '    t += step0 * (1.0 + float(i) * 0.22);'                      + #10 +
+    '    vec3 sp = pos + R * t;'                                     + #10 +
+    '    vec4 cp = uViewProj * vec4(sp, 1.0);'                       + #10 +
+    '    if (cp.w <= 0.0) break;'                                    + #10 +
+    '    vec2 uv = cp.xy / cp.w * 0.5 + 0.5;'                        + #10 +
+    '    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;' + #10 +
+    '    float sceneZ = linZ(texture(uDepth, uv).r);'                + #10 +
+    '    float rayZ = linZ(cp.z / cp.w * 0.5 + 0.5);'                + #10 +
+    '    float diff = rayZ - sceneZ;'                                + #10 +
+    '    if (diff > 0.0 && diff < 1.2) {'                            + #10 +
+    '      // двоичное уточнение: пять шагов назад-вперёд'           + #10 +
+    '      float a = t - step0 * (1.0 + float(i) * 0.22), b = t;'    + #10 +
+    '      for (int k = 0; k < 5; ++k) {'                            + #10 +
+    '        float m = (a + b) * 0.5;'                               + #10 +
+    '        vec4 cm = uViewProj * vec4(pos + R * m, 1.0);'          + #10 +
+    '        vec2 um = cm.xy / cm.w * 0.5 + 0.5;'                    + #10 +
+    '        float dz = linZ(cm.z / cm.w * 0.5 + 0.5)'               + #10 +
+    '                 - linZ(texture(uDepth, um).r);'                + #10 +
+    '        if (dz > 0.0) b = m; else a = m;'                       + #10 +
+    '      }'                                                        + #10 +
+    '      vec4 cf = uViewProj * vec4(pos + R * b, 1.0);'            + #10 +
+    '      hitUV = cf.xy / cf.w * 0.5 + 0.5;'                        + #10 +
+    '      hit = 1.0;'                                               + #10 +
+    '      break;'                                                   + #10 +
+    '    }'                                                          + #10 +
+    '  }'                                                            + #10 +
+    '  if (hit < 0.0) return;'                                       + #10 +
+    ''                                                               + #10 +
+    '  // Плавное затухание у краёв экрана: за кадром информации нет,' + #10 +
+    '  // и резкая граница отражения сразу выдаёт приём.'            + #10 +
+    '  vec2 e = smoothstep(vec2(0.0), vec2(0.12), hitUV)'            + #10 +
+    '         * smoothstep(vec2(0.0), vec2(0.12), 1.0 - hitUV);'     + #10 +
+    '  float fade = e.x * e.y;'                                      + #10 +
+    '  fade *= 1.0 - smoothstep(uMaxRough * 0.5, uMaxRough, rough);' + #10 +
+    '  fade *= clamp(-dot(R, V) * 2.0, 0.0, 1.0);'                   + #10 +
+    '  oColor = vec4(texture(uScene, hitUV).rgb, fade);'             + #10 +
+    '}' + #10;
+
   { ---------------- свечение ---------------- }
   FS_BRIGHT =
     '#version 330 core'                                              + #10 +
@@ -473,22 +588,42 @@ const
     'uniform float uOffset;'                                         + #10 +
     'void main() {'                                                  + #10 +
     '  vec2 o = uPixel * (uOffset + 0.5);'                           + #10 +
-    '  vec3 c = texture(uTex, vUV + vec2( o.x,  o.y)).rgb;'          + #10 +
-    '  c += texture(uTex, vUV + vec2(-o.x,  o.y)).rgb;'              + #10 +
-    '  c += texture(uTex, vUV + vec2( o.x, -o.y)).rgb;'              + #10 +
-    '  c += texture(uTex, vUV + vec2(-o.x, -o.y)).rgb;'              + #10 +
-    '  oColor = vec4(c * 0.25, 1.0);'                                + #10 +
+    '  // Альфу размываем вместе с цветом: у отражений в ней лежит'  + #10 +
+    '  // маска достоверности, и затирать её единицей нельзя.'       + #10 +
+    '  vec4 c = texture(uTex, vUV + vec2( o.x,  o.y));'              + #10 +
+    '  c += texture(uTex, vUV + vec2(-o.x,  o.y));'                  + #10 +
+    '  c += texture(uTex, vUV + vec2( o.x, -o.y));'                  + #10 +
+    '  c += texture(uTex, vUV + vec2(-o.x, -o.y));'                  + #10 +
+    '  oColor = c * 0.25;'                                           + #10 +
     '}' + #10;
 
   FS_COMPOSITE =
     '#version 330 core'                                              + #10 +
     'in vec2 vUV; out vec4 oColor;'                                  + #10 +
-    'uniform sampler2D uScene, uBloom;'                              + #10 +
+    'uniform sampler2D uScene, uBloom, uSSR, uMaterial, uNormal, uDepth;' + #10 +
     'uniform float uBloomMul;'                                       + #10 +
     'uniform float uBloomOn;'                                        + #10 +
+    'uniform float uSSROn;'                                          + #10 +
+    'uniform vec3 uCamPos;'                                          + #10 +
+    'uniform mat4 uInvViewProj;'                                     + #10 +
     'void main() {'                                                  + #10 +
     '  vec4 s = texture(uScene, vUV);'                               + #10 +
     '  vec3 c = s.rgb;'                                              + #10 +
+    '  float dd = texture(uDepth, vUV).r;'                           + #10 +
+    '  if (uSSROn > 0.5 && dd < 0.9999) {'                           + #10 +
+    '    vec4 r = texture(uSSR, vUV);'                               + #10 +
+    '    if (r.a > 0.01) {'                                          + #10 +
+    '      vec4 mat = texture(uMaterial, vUV);'                      + #10 +
+    '      vec4 wp = uInvViewProj * vec4(vUV*2.0-1.0, dd*2.0-1.0, 1.0);' + #10 +
+    '      vec3 Nn = normalize(texture(uNormal, vUV).xyz);'          + #10 +
+    '      vec3 Vv = normalize(uCamPos - wp.xyz / wp.w);'            + #10 +
+    '      float NoV = clamp(dot(Nn, Vv), 0.0, 1.0);'                + #10 +
+    '      // Френель: чем более скользящий угол, тем сильнее отражение' + #10 +
+    '      vec3 f0 = mix(vec3(0.04 + 0.12 * mat.b), s.rgb, mat.g);'  + #10 +
+    '      vec3 F = f0 + (vec3(1.0) - f0) * pow(1.0 - NoV, 5.0);'    + #10 +
+    '      c = mix(c, r.rgb, clamp(r.a, 0.0, 1.0) * F.g);'           + #10 +
+    '    }'                                                          + #10 +
+    '  }'                                                            + #10 +
     '  if (uBloomOn > 0.5) c += texture(uBloom, vUV).rgb * uBloomMul;' + #10 +
     '  // лёгкое виньетирование -- оно есть и в кадрах MGS V'        + #10 +
     '  vec2 q = vUV - 0.5;'                                          + #10 +
@@ -549,6 +684,7 @@ type
 
 var
   g_gbuf, g_scene, g_ao, g_aoblur, g_bright, g_blurA, g_blurB: TFoxTarget;
+  g_ssr, g_ssrblur: TFoxTarget;
   g_shadow: array[0..FOX_CASCADES - 1] of TFoxTarget;
   g_lightVP: array[0..FOX_CASCADES - 1] of TMat4;
   g_splits: TVec3;
@@ -556,7 +692,7 @@ var
   g_quadVAO: GLuint = 0;
 
   p_gbuf, p_shadow, p_ssao, p_aoblur, p_light, p_bright, p_kawase,
-  p_comp, p_fxaa, p_blit: GLuint;
+  p_comp, p_fxaa, p_blit, p_ssr: GLuint;
 
   g_sh: TSH9;
 
@@ -581,6 +717,25 @@ begin
     glDeleteShader(Result);
     Result := 0;
   end;
+end;
+
+{ Вставляет директивы сразу после строки #version: #extension обязан
+  стоять в начале, иначе компилятор GLSL его не примет. }
+function with_defs(const src, defs: string): string;
+var p: Integer;
+begin
+  if defs = '' then
+  begin
+    Result := src;
+    Exit;
+  end;
+  p := Pos(#10, src);
+  if p = 0 then
+  begin
+    Result := src;
+    Exit;
+  end;
+  Result := Copy(src, 1, p) + defs + Copy(src, p + 1, Length(src));
 end;
 
 function link_prog(const vs, fs: string): GLuint;
@@ -763,6 +918,7 @@ end;
   ========================================================================= }
 
 function fox_init(w, h: Integer): Boolean;
+var defs: string;
 begin
   fox_w := w;
   fox_h := h;
@@ -783,17 +939,26 @@ begin
   p_shadow := link_prog(VS_SHADOW, FS_SHADOW);
   p_ssao   := link_prog(VS_FULL, FS_SSAO);
   p_aoblur := link_prog(VS_FULL, FS_AOBLUR);
-  p_light  := link_prog(VS_FULL, FS_LIGHT);
+  { Если драйвер отдаёт textureGather -- берём её: это возможность
+    OpenGL 4.0, но она доступна и на контексте 3.3 как расширение. }
+  fox_gather := gl_has_extension('GL_ARB_texture_gather') and not fox_no_gather;
+  if fox_gather then
+    defs := '#extension GL_ARB_texture_gather : require' + #10 +
+            '#define USE_GATHER 1' + #10
+  else
+    defs := '';
+  p_light  := link_prog(VS_FULL, with_defs(FS_LIGHT, defs));
   p_bright := link_prog(VS_FULL, FS_BRIGHT);
   p_kawase := link_prog(VS_FULL, FS_KAWASE);
   p_comp   := link_prog(VS_FULL, FS_COMPOSITE);
   p_fxaa   := link_prog(VS_FULL, FS_FXAA);
   p_blit   := link_prog(VS_FULL, FS_BLIT);
+  p_ssr    := link_prog(VS_FULL, FS_SSR);
 
   Result := (p_gbuf <> 0) and (p_shadow <> 0) and (p_ssao <> 0) and
             (p_aoblur <> 0) and (p_light <> 0) and (p_bright <> 0) and
             (p_kawase <> 0) and (p_comp <> 0) and (p_fxaa <> 0) and
-            (p_blit <> 0);
+            (p_blit <> 0) and (p_ssr <> 0);
   if not Result then Exit;
 
   g_gbuf   := make_target(w, h, 3, True, True, False);
@@ -803,6 +968,8 @@ begin
   g_bright := make_target(w div 2, h div 2, 1, False, False, False);
   g_blurA  := make_target(w div 2, h div 2, 1, False, False, False);
   g_blurB  := make_target(w div 2, h div 2, 1, False, False, False);
+  g_ssr    := make_target(w div 2, h div 2, 1, False, False, False);
+  g_ssrblur:= make_target(w div 2, h div 2, 1, False, False, False);
 
   { карты теней: только глубина }
   for fox_w := 0 to FOX_CASCADES - 1 do
@@ -1034,6 +1201,7 @@ begin
   if fox_ssao then set1f(p_light, 'uAOOn', 1.0)
   else set1f(p_light, 'uAOOn', 0.0);
   set1f(p_light, 'uDebug', fox_debug_light);
+  set1f(p_light, 'uShadowSize', FOX_SHADOW_RES);
 
   for i := 0 to 8 do
     glUniform3f(glGetUniformLocation(p_light,
@@ -1076,12 +1244,41 @@ begin
   g_bright := src;
 end;
 
+procedure pass_ssr;
+begin
+  glBindFramebuffer(GL_FRAMEBUFFER, g_ssr.fbo);
+  glViewport(0, 0, g_ssr.w, g_ssr.h);
+  glDisable(GL_DEPTH_TEST);
+  glClearColor(0, 0, 0, 0);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glUseProgram(p_ssr);
+  bind_tex(p_ssr, 'uScene', 0, g_scene.tex[0]);
+  bind_tex(p_ssr, 'uDepth', 1, g_gbuf.depthTex);
+  bind_tex(p_ssr, 'uNormal', 2, g_gbuf.tex[1]);
+  bind_tex(p_ssr, 'uMaterial', 3, g_gbuf.tex[2]);
+  setm4(p_ssr, 'uViewProj', g_cam.viewproj);
+  setm4(p_ssr, 'uInvViewProj', m4_inverse(g_cam.viewproj));
+  set3v(p_ssr, 'uCamPos', g_cam.pos);
+  set2f(p_ssr, 'uNearFar', g_cam.znear, g_cam.zfar);
+  set1f(p_ssr, 'uMaxRough', fox_ssr_rough);
+  draw_fullscreen;
+
+  { лёгкое размытие: марш по экрану всегда даёт шум }
+  glBindFramebuffer(GL_FRAMEBUFFER, g_ssrblur.fbo);
+  glUseProgram(p_kawase);
+  set2f(p_kawase, 'uPixel', 1.0 / g_ssr.w, 1.0 / g_ssr.h);
+  set1f(p_kawase, 'uOffset', 0.0);
+  bind_tex(p_kawase, 'uTex', 0, g_ssr.tex[0]);
+  draw_fullscreen;
+end;
+
 procedure fox_resolve(targetFBO: GLuint);
 var
   final_: TFoxTarget;
 begin
   if fox_ssao then pass_ssao;
   pass_light;
+  if fox_ssr then pass_ssr;
 
   final_ := g_scene;
   if fox_bloom then pass_bloom;
@@ -1094,6 +1291,14 @@ begin
   glUseProgram(p_comp);
   bind_tex(p_comp, 'uScene', 0, final_.tex[0]);
   bind_tex(p_comp, 'uBloom', 1, g_bright.tex[0]);
+  bind_tex(p_comp, 'uSSR', 2, g_ssrblur.tex[0]);
+  bind_tex(p_comp, 'uMaterial', 3, g_gbuf.tex[2]);
+  bind_tex(p_comp, 'uNormal', 4, g_gbuf.tex[1]);
+  bind_tex(p_comp, 'uDepth', 5, g_gbuf.depthTex);
+  set3v(p_comp, 'uCamPos', g_cam.pos);
+  setm4(p_comp, 'uInvViewProj', m4_inverse(g_cam.viewproj));
+  if fox_ssr then set1f(p_comp, 'uSSROn', 1.0)
+  else set1f(p_comp, 'uSSROn', 0.0);
   set1f(p_comp, 'uBloomMul', fox_bloom_mul);
   if fox_bloom then set1f(p_comp, 'uBloomOn', 1.0)
   else set1f(p_comp, 'uBloomOn', 0.0);
@@ -1109,9 +1314,10 @@ begin
     2: t := g_gbuf.tex[2];
     3: t := g_aoblur.tex[0];
     4: t := g_bright.tex[0];
-    5: t := g_shadow[0].depthTex;
-    6: t := g_shadow[1].depthTex;
-    7: t := g_shadow[2].depthTex;
+    5: t := g_ssrblur.tex[0];
+    6: t := g_shadow[0].depthTex;
+    7: t := g_shadow[1].depthTex;
+    8: t := g_shadow[2].depthTex;
   else
     t := g_scene.tex[0];
   end;
@@ -1125,7 +1331,7 @@ begin
     set1f(p_blit, 'uScale', 0.5);
     set1f(p_blit, 'uBias', 0.5);
   end
-  else if which >= 5 then
+  else if which >= 6 then
   begin
     { глубина лежит почти вплотную к единице -- растягиваем }
     set1f(p_blit, 'uScale', 6.0);

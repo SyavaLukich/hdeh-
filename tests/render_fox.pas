@@ -30,7 +30,7 @@ type
   end;
 
 var
-  b_floor, b_box, b_ball, b_wall: TBatch;
+  b_floor, b_box, b_ball, b_wall, b_wet: TBatch;
   b_part: array[0..RD_MAX_PARTS - 1] of TBatch;
   nparts: Integer;
   cam: TCamera;
@@ -143,6 +143,9 @@ begin
   mesh_enable_instancing(b_ball.mesh, 16);
   b_wall.mesh := mesh_make_box(v3(0.4, 1.6, 6.0));
   mesh_enable_instancing(b_wall.mesh, 4);
+  { мокрая полированная площадка -- на ней видно отражения }
+  b_wet.mesh := mesh_make_box(v3(5.0, 0.03, 2.8));
+  mesh_enable_instancing(b_wet.mesh, 2);
   for i := 0 to nparts - 1 do
   begin
     if rd[0].part[i].isFoot then
@@ -161,12 +164,17 @@ var
   i, c, b: Integer;
   col: TVec4;
 begin
-  b_floor.n := 0; b_box.n := 0; b_ball.n := 0; b_wall.n := 0;
+  b_floor.n := 0; b_box.n := 0; b_ball.n := 0; b_wall.n := 0; b_wet.n := 0;
   for i := 0 to nparts - 1 do b_part[i].n := 0;
 
   { пол: песок, шероховатый диэлектрик, заметная зависимость от угла }
   batch_add(b_floor, mat4_of(v3(0, -1, 0), q_identity),
             v4_make(0.46, 0.40, 0.30, 1), v4_make(0.86, 0.0, 0.35, 0.9));
+
+  { Мокрый асфальт: гладкий диэлектрик с сильным отражением.
+    Именно такие поверхности в Ground Zeroes показывали работу SSR. }
+  batch_add(b_wet, mat4_of(v3(0.5, -0.018, 4.4), q_identity),
+            v4_make(0.055, 0.060, 0.065, 1), v4_make(0.06, 0.0, 1.0, 1.0));
 
   { контейнеры: крашеный металл }
   for i := 0 to 5 do
@@ -224,6 +232,7 @@ var i: Integer;
 
 begin
   one(b_floor);
+  one(b_wet);
   one(b_box);
   one(b_wall);
   one(b_ball);
@@ -303,12 +312,20 @@ begin
   WriteLn('GL: ', glGetString(GL_VERSION), ' / ', glGetString(GL_RENDERER));
   if not make_fbo then Halt(1);
 
+  if (ParamCount >= 1) and (ParamStr(1) = 'nogather') then fox_no_gather := True;
+  if (ParamCount >= 1) and (ParamStr(1) = 'nossr') then fox_ssr := False;
+
   if not fox_init(W, H) then
   begin
     WriteLn('не удалось собрать конвейер');
     Halt(1);
   end;
   WriteLn('конвейер ufox собран');
+  if fox_gather then
+    WriteLn('  тени: 16 выборок через textureGather (GL_ARB_texture_gather)')
+  else
+    WriteLn('  тени: 9 выборок обычным texture (расширения нет)');
+  if fox_ssr then WriteLn('  отражения в экранном пространстве: включены');
 
   { низкое солнце -- длинные тени, как в утренних кадрах MGS V }
   fox_sun_dir := v3_norm(v3(-0.74, -0.44, 0.26));
@@ -381,8 +398,10 @@ begin
   SetLength(pixels, W * H * 4);
   glBindFramebuffer(GL_FRAMEBUFFER, fbo);
   glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, @pixels[0]);
-  save_bmp('build/fox.bmp');
-  WriteLn('сохранено: build/fox.bmp');
+  if fox_no_gather then save_bmp('build/fox_nogather.bmp')
+  else if not fox_ssr then save_bmp('build/fox_nossr.bmp')
+  else save_bmp('build/fox.bmp');
+  WriteLn('кадр сохранён');
 
   { отладочные выкладки буферов, если попросили }
   if ParamCount >= 1 then
