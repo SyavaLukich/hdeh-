@@ -12,6 +12,7 @@ OUT      ?= build
 BIN      := $(OUT)/engine3d
 TESTBIN  := $(OUT)/test_physics
 RTESTBIN := $(OUT)/test_render
+XTESTBIN := $(OUT)/test_raster
 PREVBIN  := $(OUT)/render_preview
 SRC      := src/main.pas
 
@@ -42,7 +43,7 @@ debug: dirs
 	$(FPC) $(DBGFLAGS) -oengine3d $(SRC)
 
 # Тесты. Ни OpenGL, ни GLFW, ни дисплей для них не нужны.
-test: test-physics test-render
+test: test-physics test-render test-raster
 
 test-physics: dirs
 	$(FPC) -O3 $(RTLFLAGS) -Fusrc -FU$(OUT)/tunits -FE$(OUT) -otest_physics tests/test_physics.pas
@@ -52,10 +53,15 @@ test-render: dirs
 	$(FPC) -O3 $(RTLFLAGS) -Fusrc -FU$(OUT)/tunits -FE$(OUT) -otest_render tests/test_render.pas
 	./$(RTESTBIN)
 
+# Проверка самого программного растеризатора против спецификации OpenGL.
+test-raster: dirs
+	$(FPC) -O3 $(RTLFLAGS) -Fusrc -Futests -FU$(OUT)/tunits -FE$(OUT) -otest_raster tests/test_raster.pas
+	./$(XTESTBIN)
+
 # Кадр, нарисованный программным растеризатором: та же сцена, та же камера
 # и та же модель освещения, что и в шейдерах, но без видеокарты.
 preview: dirs
-	$(FPC) -O3 $(RTLFLAGS) -Fusrc -FU$(OUT)/tunits -FE$(OUT) -orender_preview tests/render_preview.pas
+	$(FPC) -O3 $(RTLFLAGS) -Fusrc -Futests -FU$(OUT)/tunits -FE$(OUT) -orender_preview tests/render_preview.pas
 	./$(PREVBIN)
 	@python3 tools/bmp2png.py $(OUT)/preview.bmp $(OUT)/preview.png 2>/dev/null \
 	  && echo "также сохранено: $(OUT)/preview.png" || true
@@ -69,4 +75,4 @@ run: all
 clean:
 	rm -rf $(OUT)
 
-.PHONY: all portable debug test test-physics test-render preview dirs run clean
+.PHONY: all portable debug test test-physics test-render test-raster preview dirs run clean
