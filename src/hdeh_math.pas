@@ -635,10 +635,10 @@ end;
 
 function Mat4Column(const M: TMat4; Index: LongInt): TVec4;
 begin
-  Result.X := M[Index, 0];
-  Result.Y := M[Index, 1];
-  Result.Z := M[Index, 2];
-  Result.W := M[Index, 3];
+  Result.X := M.M[Index, 0];
+  Result.Y := M.M[Index, 1];
+  Result.Z := M.M[Index, 2];
+  Result.W := M.M[Index, 3];
 end;
 
 function Mat4FromColumns(const C0, C1, C2, C3: TVec4): TMat4;

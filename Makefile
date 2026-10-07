@@ -27,8 +27,8 @@ CORE_UNITS = \
 	$(SRC)/hdeh_scene.pas \
 	$(SRC)/hdeh_raster.pas \
 	$(SRC)/hdeh_shadow.pas \
+	$(SRC)/hdeh_display.pas \
 	$(SRC)/hdeh_engine.pas \
-	$(BACKENDS)/hdeh_display.pas \
 	$(BACKENDS)/hdeh_console.pas \
 	$(BACKENDS)/hdeh_sdl2.pas \
 	$(SRC)/hdeh.pas
