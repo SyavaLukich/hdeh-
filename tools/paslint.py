@@ -104,6 +104,7 @@ def check(path: str) -> list:
     depth = 1 if re.match(r"\s*(unit|library)\b", clean, re.IGNORECASE) else 0
     paren = 0
     prev = None
+    block_stack = []
     for idx, (ln, tok) in enumerate(tokens):
         if tok in TYPE_OPEN:
             # "TFoo = class" opens a block; "TFoo = class(Base);" and
@@ -144,13 +145,19 @@ def check(path: str) -> list:
                 paren = 0
         elif tok in KEYWORDS_OPEN:
             depth += 1
+            block_stack.append(tok)
         elif tok in KEYWORDS_CLOSE:
             depth -= 1
+            if block_stack:
+                block_stack.pop()
             if depth < 0:
                 problems.append((ln, f"unexpected '{tok}' (block closed too often)"))
                 depth = 0
         elif tok == "else" and prev == ";":
-            problems.append((ln, "';' before 'else'"))
+            # ";" before "else" is invalid for an if statement, but perfectly
+            # normal at the end of a case branch
+            if not (block_stack and block_stack[-1] == "case"):
+                problems.append((ln, "';' before 'else'"))
         prev = tok
 
     if paren != 0:

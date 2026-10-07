@@ -99,6 +99,7 @@ type
     FDumpPrefix: string;
     FDumpEvery: LongInt;
     FDumpText: Boolean;
+    FDumpPPM: Boolean;
     FDumpedCount: LongInt;
   public
     constructor Create(AWidth, AHeight: LongInt);
@@ -113,6 +114,7 @@ type
     property DumpPrefix: string read FDumpPrefix write FDumpPrefix;
     property DumpEvery: LongInt read FDumpEvery write FDumpEvery;
     property DumpText: Boolean read FDumpText write FDumpText;
+    property DumpPPM: Boolean read FDumpPPM write FDumpPPM;
     property Frames: LongInt read FFrames;
     property DumpedCount: LongInt read FDumpedCount;
   end;
@@ -311,6 +313,7 @@ begin
   FDumpPrefix := 'frame';
   FDumpEvery := 1;
   FDumpText := True;
+  FDumpPPM := True;
   FFrames := 0;
   FDumpedCount := 0;
 end;
@@ -349,13 +352,16 @@ begin
     begin
       Path := IncludeTrailingPathDelimiter(FDumpDir) + FDumpPrefix +
               Format('%.4d', [FFrames]);
-      Img := TImage.Create(Renderer.Width, Renderer.Height);
-      try
-        Renderer.ToImage(Img);
-        Img.SavePPM(Path + '.ppm');
-      finally
-        Img.Free;
-      end;
+      if FDumpPPM then
+        begin
+          Img := TImage.Create(Renderer.Width, Renderer.Height);
+          try
+            Renderer.ToImage(Img);
+            Img.SavePPM(Path + '.ppm');
+          finally
+            Img.Free;
+          end;
+        end;
       if FDumpText then
         begin
           Txt := TStringList.Create;
