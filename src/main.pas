@@ -23,7 +23,7 @@ program main;
 {$H+}
 
 uses
-  SysUtils, umath, uglfw, ugl, ugeom, ucamera, umesh, urender, ugjk, uphysics;
+  SysUtils, Math, umath, uglfw, ugl, ugeom, ucamera, umesh, urender, ugjk, uphysics;
 
 const
   WIN_W = 1280;
@@ -395,6 +395,12 @@ var
   t0: Double;
 begin
   glfwSetErrorCallback(@on_error);
+
+  { Free Pascal по умолчанию НЕ маскирует исключения сопроцессора, а драйверы
+    OpenGL внутри себя спокойно делят на ноль и ждут тихих inf/nan. Без этой
+    строки приложение падает с EZeroDivide где-то в недрах драйвера. }
+  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide,
+                    exOverflow, exUnderflow, exPrecision]);
 
   if glfwInit() = 0 then
   begin

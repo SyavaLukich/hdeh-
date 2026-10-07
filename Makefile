@@ -58,6 +58,25 @@ test-raster: dirs
 	$(FPC) -O3 $(RTLFLAGS) -Fusrc -Futests -FU$(OUT)/tunits -FE$(OUT) -otest_raster tests/test_raster.pas
 	./$(XTESTBIN)
 
+# Безэкранный прогон НАСТОЯЩЕГО OpenGL: контекст создаётся через EGL на
+# платформе surfaceless, драйвером может быть программная Mesa (softpipe).
+# Нужны libEGL и заголовки не нужны -- всё грузится динамически.
+# Путь к своей сборке Mesa передаётся так:
+#   make render-gl MESA=/путь/к/prefix
+# Подробности и порядок сборки Mesa -- в docs/headless-gl.md
+render-gl: dirs
+	$(FPC) -O2 $(RTLFLAGS) $(if $(MESA),-Fl$(MESA)/lib/x86_64-linux-gnu) \
+	  $(if $(GLFWLIB),-Fl$(GLFWLIB)) \
+	  -Fusrc -Futests -FU$(OUT)/tunits -FE$(OUT) -orender_gl tests/render_gl.pas
+	$(if $(MESA),LD_LIBRARY_PATH=$(MESA)/lib/x86_64-linux-gnu:$(GLFWLIB)) \
+	  EGL_PLATFORM=surfaceless ./$(OUT)/render_gl
+	@python3 tools/bmp2png.py $(OUT)/gl.bmp $(OUT)/gl.png 2>/dev/null \
+	  && echo "также сохранено: $(OUT)/gl.png" || true
+
+# Сверка кадра настоящего OpenGL с кадром программного растеризатора.
+compare: preview render-gl
+	python3 tools/compare_frames.py $(OUT)/gl.bmp $(OUT)/preview.bmp $(OUT)/diff.png
+
 # Кадр, нарисованный программным растеризатором: та же сцена, та же камера
 # и та же модель освещения, что и в шейдерах, но без видеокарты.
 preview: dirs
@@ -75,4 +94,4 @@ run: all
 clean:
 	rm -rf $(OUT)
 
-.PHONY: all portable debug test test-physics test-render test-raster preview dirs run clean
+.PHONY: all portable debug test test-physics test-render test-raster preview render-gl compare dirs run clean

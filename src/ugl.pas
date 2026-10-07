@@ -53,6 +53,14 @@ const
   GL_STENCIL_BUFFER_BIT = $00000400;
   GL_COLOR_BUFFER_BIT   = $00004000;
 
+  { закадровый рендер }
+  GL_FRAMEBUFFER          = $8D40;
+  GL_RENDERBUFFER         = $8D41;
+  GL_COLOR_ATTACHMENT0    = $8CE0;
+  GL_DEPTH_ATTACHMENT     = $8D00;
+  GL_FRAMEBUFFER_COMPLETE = $8CD5;
+  GL_DEPTH_COMPONENT24    = $81A6;
+
   GL_NEVER    = $0200;
   GL_LESS     = $0201;
   GL_EQUAL    = $0202;
@@ -153,6 +161,24 @@ var
                              indices: Pointer; primcount: GLsizei); cdecl;
   glDrawArraysInstanced: procedure(mode: GLenum; first: GLint; count, primcount: GLsizei); cdecl;
 
+  { ---- закадровый рендер ----
+    Нужен и для пост-эффектов, и для проверки движка без экрана:
+    рисуем в renderbuffer и читаем пиксели обратно. }
+  glFinish:      procedure; cdecl;
+  glReadPixels:  procedure(x, y: GLint; width, height: GLsizei;
+                           format, typ: GLenum; pixels: Pointer); cdecl;
+  glGenFramebuffers:    procedure(n: GLsizei; ids: PGLuint); cdecl;
+  glBindFramebuffer:    procedure(target: GLenum; fb: GLuint); cdecl;
+  glDeleteFramebuffers: procedure(n: GLsizei; ids: PGLuint); cdecl;
+  glGenRenderbuffers:   procedure(n: GLsizei; ids: PGLuint); cdecl;
+  glBindRenderbuffer:   procedure(target: GLenum; rb: GLuint); cdecl;
+  glDeleteRenderbuffers:procedure(n: GLsizei; ids: PGLuint); cdecl;
+  glRenderbufferStorage:procedure(target, internalformat: GLenum;
+                                  width, height: GLsizei); cdecl;
+  glFramebufferRenderbuffer: procedure(target, attachment, rbtarget: GLenum;
+                                       rb: GLuint); cdecl;
+  glCheckFramebufferStatus:  function(target: GLenum): GLenum; cdecl;
+
   { ---- буферы ---- }
   glGenBuffers:    procedure(n: GLsizei; buffers: PGLuint); cdecl;
   glDeleteBuffers: procedure(n: GLsizei; const buffers: PGLuint); cdecl;
@@ -212,17 +238,32 @@ var
 
 { Загружает все указатели. Вернёт False, если драйвер не дал критичную
   функцию (значит, контекст не 3.3 Core). }
+{ Тип функции, которая отдаёт адрес процедуры OpenGL. Оконная система
+  может быть любой: GLFW отдаёт glfwGetProcAddress, headless-проверка на
+  EGL -- eglGetProcAddress. Загрузчику всё равно. }
+type
+  TGLGetProcAddress = function(const name: PChar): Pointer; cdecl;
+
+{ Загрузка через GLFW (обычный путь приложения). }
 function gl_load: Boolean;
+{ Загрузка через произвольный поставщик адресов (headless-проверки). }
+function gl_load_with(getproc: TGLGetProcAddress): Boolean;
 function gl_check(const tag: string): Boolean;
 
 implementation
 
 var
   g_missing: Integer = 0;
+  g_getproc: TGLGetProcAddress = nil;
+
+function glfw_getproc(const name: PChar): Pointer; cdecl;
+begin
+  Result := glfwGetProcAddress(name);
+end;
 
 function get_proc(const name: string): Pointer;
 begin
-  Result := glfwGetProcAddress(PChar(name));
+  Result := g_getproc(PChar(name));
   if Result = nil then
   begin
     Inc(g_missing);
@@ -232,6 +273,12 @@ end;
 
 function gl_load: Boolean;
 begin
+  Result := gl_load_with(@glfw_getproc);
+end;
+
+function gl_load_with(getproc: TGLGetProcAddress): Boolean;
+begin
+  g_getproc := getproc;
   g_missing := 0;
 
   Pointer(glClear)         := get_proc('glClear');
@@ -254,6 +301,17 @@ begin
   Pointer(glDrawArrays)    := get_proc('glDrawArrays');
   Pointer(glDrawElements)  := get_proc('glDrawElements');
   Pointer(glDrawElementsInstanced) := get_proc('glDrawElementsInstanced');
+  Pointer(glFinish)                  := get_proc('glFinish');
+  Pointer(glReadPixels)              := get_proc('glReadPixels');
+  Pointer(glGenFramebuffers)         := get_proc('glGenFramebuffers');
+  Pointer(glBindFramebuffer)         := get_proc('glBindFramebuffer');
+  Pointer(glDeleteFramebuffers)      := get_proc('glDeleteFramebuffers');
+  Pointer(glGenRenderbuffers)        := get_proc('glGenRenderbuffers');
+  Pointer(glBindRenderbuffer)        := get_proc('glBindRenderbuffer');
+  Pointer(glDeleteRenderbuffers)     := get_proc('glDeleteRenderbuffers');
+  Pointer(glRenderbufferStorage)     := get_proc('glRenderbufferStorage');
+  Pointer(glFramebufferRenderbuffer) := get_proc('glFramebufferRenderbuffer');
+  Pointer(glCheckFramebufferStatus)  := get_proc('glCheckFramebufferStatus');
   Pointer(glDrawArraysInstanced)   := get_proc('glDrawArraysInstanced');
 
   Pointer(glGenBuffers)    := get_proc('glGenBuffers');
