@@ -127,6 +127,16 @@ function  q_norm(const a: TQuat): TQuat;
 function  q_rotate(const q: TQuat; const v: TVec3): TVec3; inline;
 function  q_slerp(const a, b: TQuat; const t: Single): TQuat;
 function  q_integrate(const q: TQuat; const w: TVec3; const dt: Single): TQuat;
+{ Кватернион -> вектор поворота (ось * угол). Нужен решателю суставов:
+  ошибку ориентации удобно трактовать как "угловое смещение". }
+function  q_to_rotvec(const q: TQuat): TVec3;
+{ Кратчайший поворот, переводящий направление a в направление b. }
+function  q_from_to(const a, b: TVec3): TQuat;
+{ Разложение поворота на кручение вокруг оси twistAxis и остаточный
+  наклон (swing): q = swing * twist. Классика для суставов ragdoll --
+  конус ограничивает swing, отдельный предел ограничивает twist. }
+procedure q_swing_twist(const q: TQuat; const twistAxis: TVec3;
+                        out swing, twist: TQuat);
 
 { ------------------------------------------------------------------ 3x3 }
 function  m3_identity: TMat3;
@@ -134,7 +144,15 @@ function  m3_mul(const a, b: TMat3): TMat3;
 function  m3_transpose(const a: TMat3): TMat3;
 function  m3_mulv(const a: TMat3; const v: TVec3): TVec3; inline;
 function  m3_from_quat(const q: TQuat): TMat3;
+{ Обратное преобразование: ортонормированная матрица -> кватернион.
+  Метод Шепперда: выбираем наибольшую компоненту, чтобы не делить на малое. }
+function  q_from_mat3(const m: TMat3): TQuat;
 function  m3_scale(const a: TMat3; const s: Single): TMat3;
+function  m3_add(const a, b: TMat3): TMat3;
+function  m3_sub(const a, b: TMat3): TMat3;
+{ Кососимметричная матрица векторного произведения: m3_skew(v)*x = v x x. }
+function  m3_skew(const v: TVec3): TMat3;
+function  m3_diag(const d: TVec3): TMat3;
 function  m3_inverse(const a: TMat3): TMat3;
 
 { ------------------------------------------------------------------ AABB }
@@ -863,6 +881,155 @@ end;
 function rand_range(const a, b: Single): Single;
 begin
   Result := a + (b - a) * rand_float;
+end;
+
+function q_to_rotvec(const q: TQuat): TVec3;
+var
+  s, ang, k: Single;
+  qq: TQuat;
+begin
+  qq := q;
+  { Берём короткую дугу: -q и q задают один поворот. }
+  if qq.w < 0 then
+  begin
+    qq.x := -qq.x; qq.y := -qq.y; qq.z := -qq.z; qq.w := -qq.w;
+  end;
+  s := Sqrt(qq.x * qq.x + qq.y * qq.y + qq.z * qq.z);
+  if s < 1.0e-7 then
+  begin
+    { при малом угле sin(a/2) ~ a/2, можно без арктангенса }
+    Result := v3(qq.x * 2.0, qq.y * 2.0, qq.z * 2.0);
+    Exit;
+  end;
+  ang := 2.0 * ArcTan2(s, qq.w);
+  k := ang / s;
+  Result := v3(qq.x * k, qq.y * k, qq.z * k);
+end;
+
+function q_from_to(const a, b: TVec3): TQuat;
+var
+  na, nb, axis, t1, t2: TVec3;
+  d, s: Single;
+begin
+  na := v3_norm(a);
+  nb := v3_norm(b);
+  d := v3_dot(na, nb);
+  if d >= 1.0 - 1.0e-6 then
+  begin
+    Result := q_identity;
+    Exit;
+  end;
+  if d <= -1.0 + 1.0e-6 then
+  begin
+    { противоположные направления: поворот на пи вокруг любой нормали }
+    v3_basis(na, t1, t2);
+    Result := q_from_axis(t1, PI_F);
+    Exit;
+  end;
+  axis := v3_cross(na, nb);
+  s := Sqrt((1.0 + d) * 2.0);
+  Result.x := axis.x / s;
+  Result.y := axis.y / s;
+  Result.z := axis.z / s;
+  Result.w := s * 0.5;
+  Result := q_norm(Result);
+end;
+
+procedure q_swing_twist(const q: TQuat; const twistAxis: TVec3;
+                        out swing, twist: TQuat);
+var
+  ax, proj: TVec3;
+  d, len: Single;
+begin
+  ax := v3_norm(twistAxis);
+  { проекция мнимой части кватерниона на ось кручения }
+  d := q.x * ax.x + q.y * ax.y + q.z * ax.z;
+  proj := v3_mul(ax, d);
+  twist.x := proj.x;
+  twist.y := proj.y;
+  twist.z := proj.z;
+  twist.w := q.w;
+  len := Sqrt(twist.x * twist.x + twist.y * twist.y +
+              twist.z * twist.z + twist.w * twist.w);
+  if len < 1.0e-7 then
+    twist := q_identity
+  else
+  begin
+    twist.x := twist.x / len;
+    twist.y := twist.y / len;
+    twist.z := twist.z / len;
+    twist.w := twist.w / len;
+  end;
+  swing := q_mul(q, q_conj(twist));
+end;
+
+function q_from_mat3(const m: TMat3): TQuat;
+var
+  tr, s4: Single;
+begin
+  { матрица по колонкам: m[c*3+r] }
+  tr := m.m[0] + m.m[4] + m.m[8];
+  if tr > 0 then
+  begin
+    s4 := Sqrt(tr + 1.0) * 2.0;
+    Result.w := 0.25 * s4;
+    Result.x := (m.m[5] - m.m[7]) / s4;
+    Result.y := (m.m[6] - m.m[2]) / s4;
+    Result.z := (m.m[1] - m.m[3]) / s4;
+  end
+  else if (m.m[0] > m.m[4]) and (m.m[0] > m.m[8]) then
+  begin
+    s4 := Sqrt(1.0 + m.m[0] - m.m[4] - m.m[8]) * 2.0;
+    Result.w := (m.m[5] - m.m[7]) / s4;
+    Result.x := 0.25 * s4;
+    Result.y := (m.m[3] + m.m[1]) / s4;
+    Result.z := (m.m[6] + m.m[2]) / s4;
+  end
+  else if m.m[4] > m.m[8] then
+  begin
+    s4 := Sqrt(1.0 + m.m[4] - m.m[0] - m.m[8]) * 2.0;
+    Result.w := (m.m[6] - m.m[2]) / s4;
+    Result.x := (m.m[3] + m.m[1]) / s4;
+    Result.y := 0.25 * s4;
+    Result.z := (m.m[7] + m.m[5]) / s4;
+  end
+  else
+  begin
+    s4 := Sqrt(1.0 + m.m[8] - m.m[0] - m.m[4]) * 2.0;
+    Result.w := (m.m[1] - m.m[3]) / s4;
+    Result.x := (m.m[6] + m.m[2]) / s4;
+    Result.y := (m.m[7] + m.m[5]) / s4;
+    Result.z := 0.25 * s4;
+  end;
+  Result := q_norm(Result);
+end;
+
+function m3_add(const a, b: TMat3): TMat3;
+var i: Integer;
+begin
+  for i := 0 to 8 do Result.m[i] := a.m[i] + b.m[i];
+end;
+
+function m3_sub(const a, b: TMat3): TMat3;
+var i: Integer;
+begin
+  for i := 0 to 8 do Result.m[i] := a.m[i] - b.m[i];
+end;
+
+function m3_skew(const v: TVec3): TMat3;
+begin
+  { колонками, как и остальные матрицы в этом модуле }
+  Result.m[0] := 0;     Result.m[3] := -v.z;  Result.m[6] := v.y;
+  Result.m[1] := v.z;   Result.m[4] := 0;     Result.m[7] := -v.x;
+  Result.m[2] := -v.y;  Result.m[5] := v.x;   Result.m[8] := 0;
+end;
+
+function m3_diag(const d: TVec3): TMat3;
+begin
+  Result := m3_identity;
+  Result.m[0] := d.x;
+  Result.m[4] := d.y;
+  Result.m[8] := d.z;
 end;
 
 end.

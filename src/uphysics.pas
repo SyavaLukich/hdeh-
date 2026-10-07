@@ -33,6 +33,8 @@ const
   PHYS_MAX_PAIRS     = 16384;
   PHYS_MAX_MANIFOLDS = 8192;
   PHYS_MAX_POINTS    = 4;       { точек в одном манифолде }
+  PHYS_MAX_JOINTS    = 1024;
+  PHYS_JOINT_ITERS   = 8;       { итераций решателя суставов }
 
   { Настройки решателя. Значения подобраны для шага 1/120 с. }
   PHYS_VEL_ITERS     = 8;
@@ -111,6 +113,65 @@ type
   end;
   PManifold = ^TManifold;
 
+  { -----------------------------------------------------------------
+    Суставы
+
+    Сустав связывает два тела в точке и ограничивает их взаимный поворот.
+    Для рэгдола этого достаточно: шарнир с конусом и пределом кручения
+    описывает и плечо, и бедро, а вырожденный конус даёт колено и локоть.
+
+    Поверх ограничений живёт "мотор" -- он тянет взаимную ориентацию к
+    заданной. Это и есть мышцы: анимация задаёт целевую позу, мотор
+    отрабатывает её с конечной силой, а удар или потеря равновесия эту
+    силу пересиливают.
+    ----------------------------------------------------------------- }
+  TJointKind = (JT_BALL,     { шаровой: конус + кручение }
+                JT_HINGE,    { петля: вращение только вокруг оси X сустава }
+                JT_FIXED);   { жёсткая склейка }
+
+  TJoint = record
+    kind          : TJointKind;
+    a, b          : Integer;
+    localAnchorA  : TVec3;
+    localAnchorB  : TVec3;
+    localFrameA   : TQuat;    { ориентация сустава внутри тела A }
+    localFrameB   : TQuat;
+
+    { Пределы, рад. Ось кручения -- X системы сустава,
+      swingLimitY -- максимальный поворот ВОКРУГ оси Y сустава,
+      swingLimitZ -- вокруг оси Z. Петля (локоть, колено) получается,
+      если один предел оставить большим, а второй обнулить. }
+    swingLimitY   : Single;
+    swingLimitZ   : Single;
+    twistLo       : Single;
+    twistHi       : Single;
+
+    { мотор }
+    motor         : Boolean;
+    target        : TQuat;    { желаемая ориентация B в системе сустава A }
+    stiffness     : Single;   { 1/с: во сколько раз ошибка гасится за секунду }
+    damping       : Single;   { 0..1: доля гашения взаимного вращения }
+    maxTorque     : Single;   { ограничение момента, Н*м }
+
+    { Упреждающий момент: складывается с выходом ПД-регулятора мотора
+      ВНУТРИ решателя. Снаружи такой момент бесполезен -- жёсткий мотор
+      гасит его той же итерацией, как любое внешнее возмущение. Мышца
+      так и устроена: упреждение плюс обратная связь. }
+    biasTorque    : TVec3;
+
+    enabled       : Boolean;
+    broken        : Boolean;
+    breakForce    : Single;   { 0 = не ломается }
+
+    { рабочее состояние решателя }
+    rA, rB        : TVec3;
+    massLin       : TMat3;
+    massAng       : TMat3;
+    impLin        : TVec3;
+    lastTorque    : Single;
+  end;
+  PJoint = ^TJoint;
+
   TRayHit = record
     hit     : Boolean;
     body    : Integer;
@@ -130,6 +191,9 @@ var
   g_gravity    : TVec3;
   g_phys_time  : Double = 0;
 
+  g_joints     : array[0..PHYS_MAX_JOINTS - 1] of TJoint;
+  g_njoints    : Integer = 0;
+
   { Счётчики для профилировки }
   g_stat_pairs    : Integer = 0;
   g_stat_contacts : Integer = 0;
@@ -147,6 +211,41 @@ procedure phys_apply_force(id: Integer; const f: TVec3);
 procedure phys_wake(id: Integer);
 function  phys_pose(id: Integer): TPose; inline;
 
+{ --- суставы ---
+  Якоря и системы отсчёта берутся из текущих поз тел: где тела стоят в
+  момент создания, то положение и считается нулевым. }
+function  phys_add_joint(kind: TJointKind; a, b: Integer;
+                         const worldAnchor, worldTwistAxis: TVec3): Integer;
+{ То же, но с явной второй осью: ось Y системы сустава ложится вдоль refAxis
+  (ортогонализованной к оси кручения). Нужно там, где важна плоскость
+  сгиба -- локоть и колено. }
+function  phys_add_joint_axes(kind: TJointKind; a, b: Integer;
+                              const worldAnchor, twistAxis, refAxis: TVec3): Integer;
+procedure phys_joint_limits(id: Integer; swingY, swingZ, twistLo, twistHi: Single);
+procedure phys_joint_motor(id: Integer; on: Boolean;
+                           stiffness, damping, maxTorque: Single);
+procedure phys_joint_target(id: Integer; const q: TQuat);
+{ Текущая взаимная ориентация в системе сустава -- ею же задаётся поза. }
+function  phys_joint_current(id: Integer): TQuat;
+{ Насколько сустав вышел за свои пределы (вектор поворота, рад).
+  Слой поведения смотрит на это, чтобы понять, что конечность вывернута. }
+function  phys_joint_limit_error(id: Integer): TVec3;
+{ Момент, который мотор развил на прошлом шаге -- мера усилия мышцы. }
+function  phys_joint_torque(id: Integer): Single;
+
+{ Прямой момент на пару тел сустава: +t родителю, -t ребёнку.
+  Так работают настоящие мышцы вокруг сустава, и так удобно реализовать
+  голеностопную стратегию равновесия, где важна именно величина момента. }
+procedure phys_joint_add_torque(id: Integer; const t: TVec3);
+procedure phys_add_torque(body: Integer; const t: TVec3);
+{ Упреждающий момент мотора на этот шаг (мировые оси). Сбрасывается
+  после шага, поэтому задавать его надо каждый кадр. }
+procedure phys_joint_set_bias_torque(id: Integer; const t: TVec3);
+
+{ Пара тел, которой запрещено сталкиваться (соседние кости рэгдола). }
+procedure phys_ignore_pair(a, b: Integer);
+function  phys_pair_ignored(a, b: Integer): Boolean;
+
 { Один шаг симуляции фиксированной длины. }
 procedure phys_step(dt: Single);
 
@@ -158,6 +257,8 @@ implementation
 { =========================================================================
   Вспомогательные функции
   ========================================================================= }
+
+procedure ign_clear; forward;
 
 function body_is_dynamic(const b: TBody): Boolean; inline;
 begin
@@ -174,6 +275,8 @@ procedure phys_init;
 begin
   g_nbodies := 0;
   g_nmanifolds := 0;
+  g_njoints := 0;
+  ign_clear;
   g_gravity := v3(0, -9.81, 0);
   g_phys_time := 0;
 end;
@@ -182,6 +285,8 @@ procedure phys_clear;
 begin
   g_nbodies := 0;
   g_nmanifolds := 0;
+  g_njoints := 0;
+  ign_clear;
 end;
 
 function phys_pose(id: Integer): TPose;
@@ -223,6 +328,10 @@ begin
   begin
     b^.invMass := 0;
     b^.invIlocal := v3_zero;
+    { Обратный тензор статического тела -- НУЛЕВАЯ матрица, а не единичная.
+      Иначе решатель суставов раскручивает неподвижный якорь: он не
+      интегрируется, поэтому паразитная угловая скорость остаётся навсегда. }
+    FillChar(b^.invIworld, SizeOf(TMat3), 0);
     b^.flags := b^.flags + [BF_STATIC];
   end
   else
@@ -361,6 +470,7 @@ begin
         if not ((BF_SLEEPING in g_bodies[j].flags) and
                 (BF_SLEEPING in g_bodies[g_sorted[k]].flags)) then
           if aabb_overlap(g_bodies[j].box, g_bodies[g_sorted[k]].box) then
+           if not phys_pair_ignored(j, g_sorted[k]) then
             if g_npairs < PHYS_MAX_PAIRS then
             begin
               if j < g_sorted[k] then
@@ -995,6 +1105,16 @@ begin
        (g_bodies[g_manifolds[i].b].invMass > 0) then
       island_union(g_manifolds[i].a, g_manifolds[i].b);
 
+  { Сустав связывает тела жёстче любого контакта. Если этого не учесть,
+    половина рэгдола уснёт, а вторая останется активной: решатель будет
+    и дальше слать импульсы спящим телам, те их накопят в своей угловой
+    скорости и при пробуждении разлетятся. }
+  for i := 0 to g_njoints - 1 do
+    if g_joints[i].enabled and (not g_joints[i].broken) then
+      if (g_bodies[g_joints[i].a].invMass > 0) and
+         (g_bodies[g_joints[i].b].invMass > 0) then
+        island_union(g_joints[i].a, g_joints[i].b);
+
   { Сводим по острову минимальное время покоя и признак движения. }
   for i := 0 to g_nbodies - 1 do
   begin
@@ -1036,6 +1156,491 @@ begin
   end;
 end;
 
+{ =========================================================================
+  Суставы
+
+  Решатель тот же, что и для контактов: последовательные импульсы.
+  Порядок внутри одной итерации важен -- сначала пределы (они жёсткие),
+  потом мотор (он мягкий), потом точка крепления.
+  ========================================================================= }
+
+{ --- запрет столкновений для пар связанных тел ---
+  Храним хеш-множество пар: у рэгдола соседние кости перекрываются по
+  построению, и без этого они будут непрерывно расталкивать друг друга. }
+const
+  IGN_SIZE = 2048;
+  IGN_MASK = IGN_SIZE - 1;
+
+var
+  g_ign_a: array[0..IGN_SIZE - 1] of Integer;
+  g_ign_b: array[0..IGN_SIZE - 1] of Integer;
+  g_ign_n: Integer = 0;
+
+procedure ign_clear;
+var i: Integer;
+begin
+  for i := 0 to IGN_SIZE - 1 do g_ign_a[i] := -1;
+  g_ign_n := 0;
+end;
+
+function ign_slot(a, b: Integer): Integer; inline;
+begin
+  Result := ((a * 73856093) xor (b * 19349663)) and IGN_MASK;
+end;
+
+procedure phys_ignore_pair(a, b: Integer);
+var i, t, slot: Integer;
+begin
+  if a > b then begin t := a; a := b; b := t; end;
+  slot := ign_slot(a, b);
+  for i := 0 to IGN_SIZE - 1 do
+  begin
+    if g_ign_a[slot] = -1 then
+    begin
+      g_ign_a[slot] := a;
+      g_ign_b[slot] := b;
+      Inc(g_ign_n);
+      Exit;
+    end;
+    if (g_ign_a[slot] = a) and (g_ign_b[slot] = b) then Exit;
+    slot := (slot + 1) and IGN_MASK;
+  end;
+end;
+
+function phys_pair_ignored(a, b: Integer): Boolean;
+var i, t, slot: Integer;
+begin
+  Result := False;
+  if g_ign_n = 0 then Exit;
+  if a > b then begin t := a; a := b; b := t; end;
+  slot := ign_slot(a, b);
+  for i := 0 to IGN_SIZE - 1 do
+  begin
+    if g_ign_a[slot] = -1 then Exit;
+    if (g_ign_a[slot] = a) and (g_ign_b[slot] = b) then
+    begin
+      Result := True;
+      Exit;
+    end;
+    slot := (slot + 1) and IGN_MASK;
+  end;
+end;
+
+{ Строит кватернион системы сустава: X вдоль оси кручения, Y вдоль
+  ортогонализованной refAxis. Если refAxis пустая -- берём любой перпендикуляр. }
+function joint_frame_from_axes(const twistAxis, refAxis: TVec3): TQuat;
+var
+  ax, ry, rz, t1, t2: TVec3;
+  m: TMat3;
+begin
+  ax := v3_norm(twistAxis);
+  ry := v3_sub(refAxis, v3_mul(ax, v3_dot(refAxis, ax)));
+  if v3_lensq(ry) < 1.0e-8 then
+  begin
+    v3_basis(ax, t1, t2);
+    ry := t1;
+  end;
+  ry := v3_norm(ry);
+  rz := v3_cross(ax, ry);
+
+  { матрица из трёх колонок -> кватернион }
+  m.m[0] := ax.x; m.m[1] := ax.y; m.m[2] := ax.z;
+  m.m[3] := ry.x; m.m[4] := ry.y; m.m[5] := ry.z;
+  m.m[6] := rz.x; m.m[7] := rz.y; m.m[8] := rz.z;
+  Result := q_from_mat3(m);
+end;
+
+var
+  g_joint_ref_axis: TVec3;
+
+function phys_add_joint_axes(kind: TJointKind; a, b: Integer;
+                             const worldAnchor, twistAxis, refAxis: TVec3): Integer;
+begin
+  g_joint_ref_axis := refAxis;
+  Result := phys_add_joint(kind, a, b, worldAnchor, twistAxis);
+  g_joint_ref_axis := v3_zero;
+end;
+
+function phys_add_joint(kind: TJointKind; a, b: Integer;
+                        const worldAnchor, worldTwistAxis: TVec3): Integer;
+var
+  j: PJoint;
+  qf: TQuat;
+begin
+  Result := -1;
+  if g_njoints >= PHYS_MAX_JOINTS then Exit;
+  Result := g_njoints;
+  Inc(g_njoints);
+
+  j := @g_joints[Result];
+  FillChar(j^, SizeOf(TJoint), 0);
+  j^.kind := kind;
+  j^.a := a;
+  j^.b := b;
+
+  { Якоря -- мировая точка в локальных координатах каждого тела. }
+  j^.localAnchorA := q_rotate(q_conj(g_bodies[a].orient),
+                              v3_sub(worldAnchor, g_bodies[a].pos));
+  j^.localAnchorB := q_rotate(q_conj(g_bodies[b].orient),
+                              v3_sub(worldAnchor, g_bodies[b].pos));
+
+  { Система сустава: ось X смотрит вдоль оси кручения. }
+  qf := joint_frame_from_axes(worldTwistAxis, g_joint_ref_axis);
+  j^.localFrameA := q_mul(q_conj(g_bodies[a].orient), qf);
+  j^.localFrameB := q_mul(q_conj(g_bodies[b].orient), qf);
+
+  j^.target := q_identity;
+  j^.swingLimitY := PI_F;
+  j^.swingLimitZ := PI_F;
+  j^.twistLo := -PI_F;
+  j^.twistHi := PI_F;
+  j^.enabled := True;
+  j^.stiffness := 0;
+  j^.damping := 0;
+  j^.maxTorque := 0;
+
+  if kind = JT_FIXED then
+  begin
+    j^.swingLimitY := 0;
+    j^.swingLimitZ := 0;
+    j^.twistLo := 0;
+    j^.twistHi := 0;
+  end
+  else if kind = JT_HINGE then
+  begin
+    j^.swingLimitY := 0;
+    j^.swingLimitZ := 0;
+  end;
+
+  { Связанные тела друг с другом не сталкиваются. }
+  phys_ignore_pair(a, b);
+end;
+
+procedure phys_joint_limits(id: Integer; swingY, swingZ, twistLo, twistHi: Single);
+begin
+  if (id < 0) or (id >= g_njoints) then Exit;
+  g_joints[id].swingLimitY := swingY;
+  g_joints[id].swingLimitZ := swingZ;
+  g_joints[id].twistLo := twistLo;
+  g_joints[id].twistHi := twistHi;
+end;
+
+procedure phys_joint_motor(id: Integer; on: Boolean;
+                           stiffness, damping, maxTorque: Single);
+begin
+  if (id < 0) or (id >= g_njoints) then Exit;
+  g_joints[id].motor := on;
+  g_joints[id].stiffness := stiffness;
+  g_joints[id].damping := damping;
+  g_joints[id].maxTorque := maxTorque;
+end;
+
+procedure phys_joint_target(id: Integer; const q: TQuat);
+begin
+  if (id < 0) or (id >= g_njoints) then Exit;
+  g_joints[id].target := q_norm(q);
+end;
+
+function joint_frameA(const j: TJoint): TQuat; inline;
+begin
+  Result := q_mul(g_bodies[j.a].orient, j.localFrameA);
+end;
+
+function joint_frameB(const j: TJoint): TQuat; inline;
+begin
+  Result := q_mul(g_bodies[j.b].orient, j.localFrameB);
+end;
+
+function phys_joint_current(id: Integer): TQuat;
+begin
+  if (id < 0) or (id >= g_njoints) then
+  begin
+    Result := q_identity;
+    Exit;
+  end;
+  Result := q_mul(q_conj(joint_frameA(g_joints[id])),
+                  joint_frameB(g_joints[id]));
+end;
+
+function joint_clamp_rotation(const j: TJoint; const qrel: TQuat): TQuat; forward;
+
+procedure phys_add_torque(body: Integer; const t: TVec3);
+begin
+  if (body < 0) or (body >= g_nbodies) then Exit;
+  if not body_is_dynamic(g_bodies[body]) then Exit;
+  g_bodies[body].torque := v3_add(g_bodies[body].torque, t);
+  phys_wake(body);
+end;
+
+procedure phys_joint_add_torque(id: Integer; const t: TVec3);
+begin
+  if (id < 0) or (id >= g_njoints) then Exit;
+  phys_add_torque(g_joints[id].a, t);
+  phys_add_torque(g_joints[id].b, v3_neg(t));
+end;
+
+procedure phys_joint_set_bias_torque(id: Integer; const t: TVec3);
+begin
+  if (id < 0) or (id >= g_njoints) then Exit;
+  g_joints[id].biasTorque := t;
+end;
+
+function phys_joint_limit_error(id: Integer): TVec3;
+var qrel: TQuat;
+begin
+  if (id < 0) or (id >= g_njoints) then
+  begin
+    Result := v3_zero;
+    Exit;
+  end;
+  qrel := phys_joint_current(id);
+  Result := q_to_rotvec(q_mul(joint_clamp_rotation(g_joints[id], qrel),
+                              q_conj(qrel)));
+end;
+
+function phys_joint_torque(id: Integer): Single;
+begin
+  if (id < 0) or (id >= g_njoints) then Result := 0
+  else Result := g_joints[id].lastTorque;
+end;
+
+{ Эффективная масса точечной связи:
+  K = (1/mA + 1/mB)*E - [rA]x * IA^-1 * [rA]x - [rB]x * IB^-1 * [rB]x }
+procedure joint_prepare(dt: Single);
+var
+  i: Integer;
+  j: PJoint;
+  ba, bb: PBody;
+  k, sa, sb: TMat3;
+begin
+  for i := 0 to g_njoints - 1 do
+  begin
+    j := @g_joints[i];
+    if (not j^.enabled) or j^.broken then Continue;
+    ba := @g_bodies[j^.a];
+    bb := @g_bodies[j^.b];
+
+    j^.rA := q_rotate(ba^.orient, j^.localAnchorA);
+    j^.rB := q_rotate(bb^.orient, j^.localAnchorB);
+
+    k := m3_diag(v3(ba^.invMass + bb^.invMass,
+                    ba^.invMass + bb^.invMass,
+                    ba^.invMass + bb^.invMass));
+    sa := m3_skew(j^.rA);
+    sb := m3_skew(j^.rB);
+    k := m3_sub(k, m3_mul(sa, m3_mul(ba^.invIworld, sa)));
+    k := m3_sub(k, m3_mul(sb, m3_mul(bb^.invIworld, sb)));
+    j^.massLin := m3_inverse(k);
+
+    { угловая эффективная масса: (IA^-1 + IB^-1)^-1 }
+    j^.massAng := m3_inverse(m3_add(ba^.invIworld, bb^.invIworld));
+
+    j^.impLin := v3_zero;
+    j^.lastTorque := 0;
+
+    { Сустав держит тела в активном состоянии: спящая кость в рэгдоле
+      выглядит как сломанная. }
+    if j^.motor then
+    begin
+      phys_wake(j^.a);
+      phys_wake(j^.b);
+    end;
+  end;
+end;
+
+{ Применение углового импульса к паре тел. }
+procedure apply_ang_impulse(ba, bb: PBody; const imp: TVec3); inline;
+begin
+  if body_is_dynamic(ba^) then
+    ba^.angvel := v3_sub(ba^.angvel, m3_mulv(ba^.invIworld, imp));
+  if body_is_dynamic(bb^) then
+    bb^.angvel := v3_add(bb^.angvel, m3_mulv(bb^.invIworld, imp));
+end;
+
+{ Ограничение взаимного поворота. Возвращает кватернион, загнанный
+  в пределы конуса и кручения. }
+function joint_clamp_rotation(const j: TJoint; const qrel: TQuat): TQuat;
+var
+  swing, twist: TQuat;
+  sv, tv: TVec3;
+  ang, lim, t: Single;
+begin
+  q_swing_twist(qrel, v3(1, 0, 0), swing, twist);
+
+  { --- кручение --- }
+  tv := q_to_rotvec(twist);
+  t := tv.x;
+  if t < j.twistLo then t := j.twistLo;
+  if t > j.twistHi then t := j.twistHi;
+  twist := q_from_axis(v3(1, 0, 0), t);
+
+  { --- наклон: эллиптический конус по двум осям --- }
+  sv := q_to_rotvec(swing);
+  sv.x := 0;                       { кручение уже вынесено }
+  ang := v3_len(sv);
+  if ang > EPS then
+  begin
+    { предел в направлении текущего наклона -- эллипс между Y и Z }
+    lim := Sqrt(Sqr(sv.y / ang * j.swingLimitY) +
+                Sqr(sv.z / ang * j.swingLimitZ));
+    if ang > lim then
+      sv := v3_mul(sv, lim / ang);
+  end;
+  if v3_len(sv) > EPS then
+    swing := q_from_axis(v3_norm(sv), v3_len(sv))
+  else
+    swing := q_identity;
+
+  Result := q_norm(q_mul(swing, twist));
+end;
+
+{ Одна итерация решателя суставов. }
+procedure joints_iterate(dt: Single);
+var
+  i: Integer;
+  j: PJoint;
+  ba, bb: PBody;
+  fa, fb, qrel, qclamp, qdes, qerr: TQuat;
+  evec, wrel, dw, imp, cv, vrel, bias, cpos: TVec3;
+  invdt, maxImp, l: Single;
+begin
+  if dt <= 0 then Exit;
+  invdt := 1.0 / dt;
+
+  for i := 0 to g_njoints - 1 do
+  begin
+    j := @g_joints[i];
+    if (not j^.enabled) or j^.broken then Continue;
+    ba := @g_bodies[j^.a];
+    bb := @g_bodies[j^.b];
+    { оба спят -- трогать нечего }
+    if (BF_SLEEPING in ba^.flags) and (BF_SLEEPING in bb^.flags) then Continue;
+    { один спит, другой нет -- будим, иначе импульсы уйдут в никуда }
+    if BF_SLEEPING in ba^.flags then phys_wake(j^.a);
+    if BF_SLEEPING in bb^.flags then phys_wake(j^.b);
+
+    fa := joint_frameA(j^);
+    fb := joint_frameB(j^);
+    qrel := q_mul(q_conj(fa), fb);
+    wrel := v3_sub(bb^.angvel, ba^.angvel);
+
+    { ---- 1. пределы: жёстко загоняем ориентацию обратно в конус ---- }
+    qclamp := joint_clamp_rotation(j^, qrel);
+    qdes := q_mul(fa, qclamp);
+    qerr := q_mul(qdes, q_conj(fb));
+    evec := q_to_rotvec(qerr);
+    if v3_lensq(evec) > 1.0e-10 then
+    begin
+      { Нарушение предела снимаем за несколько шагов, иначе сустав
+        выстреливает. Скорость "выпрямления" ограничена. }
+      dw := v3_mul(evec, 0.4 * invdt);
+      l := v3_len(dw);
+      if l > 8.0 then dw := v3_mul(dw, 8.0 / l);
+      { гасим и ту часть взаимного вращения, что уводит дальше за предел }
+      dw := v3_sub(dw, v3_mul(v3_norm(evec),
+                    fmin(v3_dot(wrel, v3_norm(evec)), 0.0)));
+      imp := m3_mulv(j^.massAng, dw);
+      apply_ang_impulse(ba, bb, imp);
+      wrel := v3_sub(bb^.angvel, ba^.angvel);
+    end;
+
+    { ---- 2. мотор: тянем ориентацию к целевой позе ---- }
+    if j^.motor and (j^.maxTorque > 0) then
+    begin
+      qdes := q_mul(fa, joint_clamp_rotation(j^, j^.target));
+      qerr := q_mul(qdes, q_conj(fb));
+      evec := q_to_rotvec(qerr);
+
+      { PD на уровне скоростей: нужная добавка к взаимному вращению. }
+      dw := v3_sub(v3_mul(evec, j^.stiffness), v3_mul(wrel, j^.damping));
+      imp := m3_mulv(j^.massAng, dw);
+
+      { Упреждение. Знак: момент прикладывается к ребёнку, к родителю --
+        обратный, как и у ПД-части. }
+      if not v3_iszero(j^.biasTorque) then
+        imp := v3_add(imp, v3_mul(j^.biasTorque, dt / PHYS_VEL_ITERS));
+
+      maxImp := j^.maxTorque * dt;
+      l := v3_len(imp);
+      if l > maxImp then imp := v3_mul(imp, maxImp / l);
+      j^.lastTorque := v3_len(imp) * invdt;
+
+      apply_ang_impulse(ba, bb, imp);
+    end;
+
+    { ---- 3. точка крепления ---- }
+    cpos := v3_sub(v3_add(bb^.pos, j^.rB), v3_add(ba^.pos, j^.rA));
+    vrel := v3_sub(v3_add(bb^.linvel, v3_cross(bb^.angvel, j^.rB)),
+                   v3_add(ba^.linvel, v3_cross(ba^.angvel, j^.rA)));
+    { небольшое смещение Баумгарта: сустав не должен "плыть" }
+    bias := v3_mul(cpos, 0.2 * invdt);
+    l := v3_len(bias);
+    if l > 3.0 then bias := v3_mul(bias, 3.0 / l);
+
+    cv := v3_add(vrel, bias);
+    imp := v3_neg(m3_mulv(j^.massLin, cv));
+    j^.impLin := v3_add(j^.impLin, imp);
+
+    if body_is_dynamic(ba^) then
+    begin
+      ba^.linvel := v3_sub(ba^.linvel, v3_mul(imp, ba^.invMass));
+      ba^.angvel := v3_sub(ba^.angvel, m3_mulv(ba^.invIworld,
+                                               v3_cross(j^.rA, imp)));
+    end;
+    if body_is_dynamic(bb^) then
+    begin
+      bb^.linvel := v3_add(bb^.linvel, v3_mul(imp, bb^.invMass));
+      bb^.angvel := v3_add(bb^.angvel, m3_mulv(bb^.invIworld,
+                                               v3_cross(j^.rB, imp)));
+    end;
+  end;
+
+  { Разрыв связей: суставу можно задать предел по накопленному импульсу. }
+  for i := 0 to g_njoints - 1 do
+  begin
+    j := @g_joints[i];
+    if j^.broken or (j^.breakForce <= 0) then Continue;
+    if v3_len(j^.impLin) * invdt > j^.breakForce then
+    begin
+      j^.broken := True;
+      phys_wake(j^.a);
+      phys_wake(j^.b);
+    end;
+  end;
+end;
+
+{ Позиционный проход: убираем накопленное расхождение якорей.
+  Без него длинная цепь костей заметно растягивается. }
+procedure joints_positions;
+var
+  i, it: Integer;
+  j: PJoint;
+  ba, bb: PBody;
+  pa, pb, d, corr: TVec3;
+  totalInv, l: Single;
+begin
+  for it := 1 to 4 do
+    for i := 0 to g_njoints - 1 do
+    begin
+      j := @g_joints[i];
+      if (not j^.enabled) or j^.broken then Continue;
+      ba := @g_bodies[j^.a];
+      bb := @g_bodies[j^.b];
+      totalInv := ba^.invMass + bb^.invMass;
+      if totalInv <= EPS then Continue;
+
+      pa := v3_add(ba^.pos, q_rotate(ba^.orient, j^.localAnchorA));
+      pb := v3_add(bb^.pos, q_rotate(bb^.orient, j^.localAnchorB));
+      d := v3_sub(pb, pa);
+      l := v3_len(d);
+      if l < 0.001 then Continue;
+
+      corr := v3_mul(d, 0.8 / totalInv);
+      ba^.pos := v3_add(ba^.pos, v3_mul(corr, ba^.invMass));
+      bb^.pos := v3_sub(bb^.pos, v3_mul(corr, bb^.invMass));
+    end;
+end;
+
 procedure phys_step(dt: Single);
 var i: Integer;
 begin
@@ -1050,12 +1655,21 @@ begin
   narrowphase;
 
   solver_prepare(dt);
+  joint_prepare(dt);
   for i := 1 to PHYS_VEL_ITERS do
+  begin
+    joints_iterate(dt);
     solver_iterate;
+  end;
 
   integrate_positions(dt);
   solver_positions;
+  joints_positions;
   resolve_sleeping;
+
+  { Упреждающие моменты живут один шаг. }
+  for i := 0 to g_njoints - 1 do
+    g_joints[i].biasTorque := v3_zero;
 
   g_phys_time := g_phys_time + dt;
 end;

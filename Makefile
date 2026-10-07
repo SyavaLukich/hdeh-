@@ -43,7 +43,7 @@ debug: dirs
 	$(FPC) $(DBGFLAGS) -oengine3d $(SRC)
 
 # Тесты. Ни OpenGL, ни GLFW, ни дисплей для них не нужны.
-test: test-physics test-render test-raster
+test: test-physics test-render test-raster test-anim
 
 test-physics: dirs
 	$(FPC) -O3 $(RTLFLAGS) -Fusrc -FU$(OUT)/tunits -FE$(OUT) -otest_physics tests/test_physics.pas
@@ -52,6 +52,28 @@ test-physics: dirs
 test-render: dirs
 	$(FPC) -O3 $(RTLFLAGS) -Fusrc -FU$(OUT)/tunits -FE$(OUT) -otest_render tests/test_render.pas
 	./$(RTESTBIN)
+
+# Скелет, анимация, суставы, рэгдол и слой поведения.
+test-anim: dirs
+	$(FPC) -O2 $(RTLFLAGS) -Fusrc -Futests -FU$(OUT)/tunits -FE$(OUT) -otest_anim tests/test_anim.pas
+	./$(OUT)/test_anim
+
+# Кадр со скелетной анимацией, рэгдолом и реакциями (программный растеризатор).
+render-ragdoll: dirs
+	$(FPC) -O2 $(RTLFLAGS) -Fusrc -Futests -FU$(OUT)/tunits -FE$(OUT) -orender_ragdoll tests/render_ragdoll.pas
+	./$(OUT)/render_ragdoll
+	@python3 tools/bmp2png.py $(OUT)/ragdoll.bmp $(OUT)/ragdoll.png 2>/dev/null \
+	  && echo "также сохранено: $(OUT)/ragdoll.png" || true
+
+# То же самое, но настоящим OpenGL через EGL (см. docs/headless-gl.md).
+render-ragdoll-gl: dirs
+	$(FPC) -O2 $(RTLFLAGS) $(if $(MESA),-Fl$(MESA)/lib/x86_64-linux-gnu) \
+	  $(if $(GLFWLIB),-Fl$(GLFWLIB)) \
+	  -Fusrc -Futests -FU$(OUT)/tunits -FE$(OUT) -orender_ragdoll_gl tests/render_ragdoll_gl.pas
+	$(if $(MESA),LD_LIBRARY_PATH=$(MESA)/lib/x86_64-linux-gnu:$(GLFWLIB)) \
+	  EGL_PLATFORM=surfaceless ./$(OUT)/render_ragdoll_gl
+	@python3 tools/bmp2png.py $(OUT)/ragdoll_gl.bmp $(OUT)/ragdoll_gl.png 2>/dev/null \
+	  && echo "также сохранено: $(OUT)/ragdoll_gl.png" || true
 
 # Проверка самого программного растеризатора против спецификации OpenGL.
 test-raster: dirs
@@ -94,4 +116,4 @@ run: all
 clean:
 	rm -rf $(OUT)
 
-.PHONY: all portable debug test test-physics test-render test-raster preview render-gl compare dirs run clean
+.PHONY: all portable debug test test-physics test-render test-raster test-anim preview render-gl render-ragdoll render-ragdoll-gl compare dirs run clean
