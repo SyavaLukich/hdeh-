@@ -1,0 +1,1734 @@
+{ ============================================================================
+  uphysics.pas  --  физический движок твёрдых тел
+
+  Архитектура повторяет то, что делали в Quake 3 и в движках Pangea: один
+  глобальный мир, плоские массивы фиксированного размера, никакой динамики
+  во время шага симуляции.
+
+  Конвейер одного шага:
+    1. интегрирование сил            (симплектический Эйлер)
+    2. широкая фаза                  (sweep and prune по оси X)
+    3. узкая фаза                    (GJK + EPA из модуля ugjk)
+    4. накопление устойчивых манифолдов (до 4 точек, с историей)
+    5. решатель последовательных импульсов (с тёплым стартом)
+    6. интегрирование положений и засыпание тел
+
+  Всё считается в Single: современные процессоры обрабатывают 8 таких
+  чисел за такт в AVX, а для игровой физики точности хватает с запасом.
+  ============================================================================ }
+unit uphysics;
+
+{$MODE OBJFPC}
+{$H+}
+{$INLINE ON}
+{$OPTIMIZATION LEVEL3}
+
+interface
+
+uses
+  umath, ugjk;
+
+const
+  PHYS_MAX_BODIES    = 4096;
+  PHYS_MAX_PAIRS     = 16384;
+  PHYS_MAX_MANIFOLDS = 8192;
+  PHYS_MAX_POINTS    = 4;       { точек в одном манифолде }
+  PHYS_MAX_JOINTS    = 1024;
+  PHYS_JOINT_ITERS   = 8;       { итераций решателя суставов }
+
+  { Настройки решателя. Значения подобраны для шага 1/120 с. }
+  PHYS_VEL_ITERS     = 8;
+  PHYS_POS_ITERS     = 4;
+  PHYS_SLOP          = 0.005;   { допустимое проникновение, м }
+  { Смещение Баумгарта в решателе скоростей оставлено минимальным: оно
+    добавляет телу энергию и на быстром ударе даёт заметный "подскок".
+    Проникновение убирает отдельный позиционный проход (split impulse). }
+  PHYS_BAUMGARTE     = 0.0;
+  PHYS_MAX_BIAS      = 2.0;     { ограничение скорости выталкивания, м/с }
+  PHYS_POS_RELAX     = 0.6;     { доля ошибки, снимаемая за итерацию }
+  PHYS_PERTURB       = 0.03;    { угол доворота при поиске доп. точек, рад }
+  PHYS_REST_THRESH   = 1.0;     { ниже этой скорости отскок не считается }
+  PHYS_SLEEP_LIN     = 0.08;
+  PHYS_SLEEP_ANG     = 0.10;
+  PHYS_SLEEP_TIME    = 0.6;
+  PHYS_CONTACT_TOL   = 0.02;    { радиус склейки точек манифолда }
+  PHYS_MAX_CORRECT   = 0.2;     { ограничение на коррекцию за шаг, м }
+
+type
+  TBodyFlags = set of (BF_STATIC, BF_SLEEPING, BF_NOSLEEP, BF_ENABLED,
+                       BF_LOCK_ROT);
+
+  { Твёрдое тело. Хранится по значению в плоском массиве -- проход
+    по телам линеен по памяти, префетчер процессора на этом отдыхает. }
+  TBody = record
+    pos        : TVec3;
+    orient     : TQuat;
+    linvel     : TVec3;
+    angvel     : TVec3;
+    force      : TVec3;
+    torque     : TVec3;
+
+    invMass    : Single;
+    invIlocal  : TVec3;    { диагональ обратного тензора в локальных осях }
+    invIworld  : TMat3;    { пересчитывается каждый шаг }
+
+    friction   : Single;
+    restitution: Single;
+    linDamp    : Single;
+    angDamp    : Single;
+
+    shape      : Integer;  { индекс в таблице форм }
+    flags      : TBodyFlags;
+    sleepTimer : Single;
+    box        : TAABB;
+    userTag    : Integer;  { на что сослаться из игровой логики }
+  end;
+  PBody = ^TBody;
+
+  { Одна точка контакта. Храним якоря в локальных координатах тел --
+    это позволяет узнавать точку на следующем кадре и переносить
+    накопленный импульс (тёплый старт). }
+  TContactPoint = record
+    localA, localB : TVec3;
+    rA, rB         : TVec3;   { от центра масс к точке, мировые }
+    normalImpulse  : Single;
+    tangImpulse    : array[0..1] of Single;
+    massNormal     : Single;
+    massTang       : array[0..1] of Single;
+    bias           : Single;
+    penetration    : Single;
+    relvel0        : Single;  { нормальная скорость до решателя (для отскока) }
+    age            : Integer;
+  end;
+
+  TManifold = record
+    a, b      : Integer;      { индексы тел }
+    normal    : TVec3;        { из A в B }
+    tangent   : array[0..1] of TVec3;
+    npoints   : Integer;
+    pt        : array[0..PHYS_MAX_POINTS - 1] of TContactPoint;
+    friction  : Single;
+    restitution: Single;
+    alive     : Boolean;
+  end;
+  PManifold = ^TManifold;
+
+  { -----------------------------------------------------------------
+    Суставы
+
+    Сустав связывает два тела в точке и ограничивает их взаимный поворот.
+    Для рэгдола этого достаточно: шарнир с конусом и пределом кручения
+    описывает и плечо, и бедро, а вырожденный конус даёт колено и локоть.
+
+    Поверх ограничений живёт "мотор" -- он тянет взаимную ориентацию к
+    заданной. Это и есть мышцы: анимация задаёт целевую позу, мотор
+    отрабатывает её с конечной силой, а удар или потеря равновесия эту
+    силу пересиливают.
+    ----------------------------------------------------------------- }
+  TJointKind = (JT_BALL,     { шаровой: конус + кручение }
+                JT_HINGE,    { петля: вращение только вокруг оси X сустава }
+                JT_FIXED);   { жёсткая склейка }
+
+  TJoint = record
+    kind          : TJointKind;
+    a, b          : Integer;
+    localAnchorA  : TVec3;
+    localAnchorB  : TVec3;
+    localFrameA   : TQuat;    { ориентация сустава внутри тела A }
+    localFrameB   : TQuat;
+
+    { Пределы, рад. Ось кручения -- X системы сустава,
+      swingLimitY -- максимальный поворот ВОКРУГ оси Y сустава,
+      swingLimitZ -- вокруг оси Z. Петля (локоть, колено) получается,
+      если один предел оставить большим, а второй обнулить. }
+    swingLimitY   : Single;
+    swingLimitZ   : Single;
+    twistLo       : Single;
+    twistHi       : Single;
+
+    { мотор }
+    motor         : Boolean;
+    target        : TQuat;    { желаемая ориентация B в системе сустава A }
+    stiffness     : Single;   { 1/с: во сколько раз ошибка гасится за секунду }
+    damping       : Single;   { 0..1: доля гашения взаимного вращения }
+    maxTorque     : Single;   { ограничение момента, Н*м }
+
+    { Упреждающий момент: складывается с выходом ПД-регулятора мотора
+      ВНУТРИ решателя. Снаружи такой момент бесполезен -- жёсткий мотор
+      гасит его той же итерацией, как любое внешнее возмущение. Мышца
+      так и устроена: упреждение плюс обратная связь. }
+    biasTorque    : TVec3;
+
+    enabled       : Boolean;
+    broken        : Boolean;
+    breakForce    : Single;   { 0 = не ломается }
+
+    { рабочее состояние решателя }
+    rA, rB        : TVec3;
+    massLin       : TMat3;
+    massAng       : TMat3;
+    impLin        : TVec3;
+    lastTorque    : Single;
+  end;
+  PJoint = ^TJoint;
+
+  TRayHit = record
+    hit     : Boolean;
+    body    : Integer;
+    point   : TVec3;
+    normal  : TVec3;
+    distance: Single;
+  end;
+
+var
+  { Глобальное состояние мира -- в духе старых движков, без фабрик и
+    синглтонов: просто модульные переменные. }
+  g_bodies     : array[0..PHYS_MAX_BODIES - 1] of TBody;
+  g_shapes     : array[0..PHYS_MAX_BODIES - 1] of TShape;
+  g_nbodies    : Integer = 0;
+  g_manifolds  : array[0..PHYS_MAX_MANIFOLDS - 1] of TManifold;
+  g_nmanifolds : Integer = 0;
+  g_gravity    : TVec3;
+  g_phys_time  : Double = 0;
+
+  g_joints     : array[0..PHYS_MAX_JOINTS - 1] of TJoint;
+  g_njoints    : Integer = 0;
+
+  { Счётчики для профилировки }
+  g_stat_pairs    : Integer = 0;
+  g_stat_contacts : Integer = 0;
+  g_stat_awake    : Integer = 0;
+
+procedure phys_init;
+procedure phys_clear;
+
+{ Создаёт тело. mass = 0 -> статическое. Возвращает индекс тела. }
+function  phys_add_body(const s: TShape; const pos: TVec3; const q: TQuat;
+                        mass: Single): Integer;
+procedure phys_set_material(id: Integer; friction, restitution: Single);
+procedure phys_apply_impulse(id: Integer; const imp, point: TVec3);
+procedure phys_apply_force(id: Integer; const f: TVec3);
+procedure phys_wake(id: Integer);
+function  phys_pose(id: Integer): TPose; inline;
+
+{ --- суставы ---
+  Якоря и системы отсчёта берутся из текущих поз тел: где тела стоят в
+  момент создания, то положение и считается нулевым. }
+function  phys_add_joint(kind: TJointKind; a, b: Integer;
+                         const worldAnchor, worldTwistAxis: TVec3): Integer;
+{ То же, но с явной второй осью: ось Y системы сустава ложится вдоль refAxis
+  (ортогонализованной к оси кручения). Нужно там, где важна плоскость
+  сгиба -- локоть и колено. }
+function  phys_add_joint_axes(kind: TJointKind; a, b: Integer;
+                              const worldAnchor, twistAxis, refAxis: TVec3): Integer;
+procedure phys_joint_limits(id: Integer; swingY, swingZ, twistLo, twistHi: Single);
+procedure phys_joint_motor(id: Integer; on: Boolean;
+                           stiffness, damping, maxTorque: Single);
+procedure phys_joint_target(id: Integer; const q: TQuat);
+{ Текущая взаимная ориентация в системе сустава -- ею же задаётся поза. }
+function  phys_joint_current(id: Integer): TQuat;
+{ Насколько сустав вышел за свои пределы (вектор поворота, рад).
+  Слой поведения смотрит на это, чтобы понять, что конечность вывернута. }
+function  phys_joint_limit_error(id: Integer): TVec3;
+{ Момент, который мотор развил на прошлом шаге -- мера усилия мышцы. }
+function  phys_joint_torque(id: Integer): Single;
+
+{ Прямой момент на пару тел сустава: +t родителю, -t ребёнку.
+  Так работают настоящие мышцы вокруг сустава, и так удобно реализовать
+  голеностопную стратегию равновесия, где важна именно величина момента. }
+procedure phys_joint_add_torque(id: Integer; const t: TVec3);
+procedure phys_add_torque(body: Integer; const t: TVec3);
+{ Упреждающий момент мотора на этот шаг (мировые оси). Сбрасывается
+  после шага, поэтому задавать его надо каждый кадр. }
+procedure phys_joint_set_bias_torque(id: Integer; const t: TVec3);
+
+{ Пара тел, которой запрещено сталкиваться (соседние кости рэгдола). }
+procedure phys_ignore_pair(a, b: Integer);
+function  phys_pair_ignored(a, b: Integer): Boolean;
+
+{ Один шаг симуляции фиксированной длины. }
+procedure phys_step(dt: Single);
+
+{ Трассировка луча по всему миру. }
+function  phys_raycast(const ro, rd: TVec3; maxdist: Single): TRayHit;
+
+implementation
+
+{ =========================================================================
+  Вспомогательные функции
+  ========================================================================= }
+
+procedure ign_clear; forward;
+
+function body_is_dynamic(const b: TBody): Boolean; inline;
+begin
+  Result := (b.invMass > 0) and not (BF_STATIC in b.flags);
+end;
+
+function body_active(const b: TBody): Boolean; inline;
+begin
+  Result := (BF_ENABLED in b.flags) and not (BF_SLEEPING in b.flags)
+            and body_is_dynamic(b);
+end;
+
+procedure phys_init;
+begin
+  g_nbodies := 0;
+  g_nmanifolds := 0;
+  g_njoints := 0;
+  ign_clear;
+  g_gravity := v3(0, -9.81, 0);
+  g_phys_time := 0;
+end;
+
+procedure phys_clear;
+begin
+  g_nbodies := 0;
+  g_nmanifolds := 0;
+  g_njoints := 0;
+  ign_clear;
+end;
+
+function phys_pose(id: Integer): TPose;
+begin
+  Result.p := g_bodies[id].pos;
+  Result.q := g_bodies[id].orient;
+end;
+
+function phys_add_body(const s: TShape; const pos: TVec3; const q: TQuat;
+                       mass: Single): Integer;
+var
+  b: PBody;
+  I: TMat3;
+  id: Integer;
+begin
+  if g_nbodies >= PHYS_MAX_BODIES then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  id := g_nbodies;
+  Inc(g_nbodies);
+
+  g_shapes[id] := s;
+  b := @g_bodies[id];
+  FillChar(b^, SizeOf(TBody), 0);
+
+  b^.pos := pos;
+  b^.orient := q_norm(q);
+  b^.shape := id;
+  b^.friction := 0.5;
+  b^.restitution := 0.1;
+  b^.linDamp := 0.02;
+  b^.angDamp := 0.05;
+  b^.flags := [BF_ENABLED];
+  b^.invIworld := m3_identity;
+
+  if mass <= 0 then
+  begin
+    b^.invMass := 0;
+    b^.invIlocal := v3_zero;
+    { Обратный тензор статического тела -- НУЛЕВАЯ матрица, а не единичная.
+      Иначе решатель суставов раскручивает неподвижный якорь: он не
+      интегрируется, поэтому паразитная угловая скорость остаётся навсегда. }
+    FillChar(b^.invIworld, SizeOf(TMat3), 0);
+    b^.flags := b^.flags + [BF_STATIC];
+  end
+  else
+  begin
+    b^.invMass := 1.0 / mass;
+    I := shape_inertia(s, mass);
+    { Тензор диагональный -- этого достаточно для примитивов, а для
+      оболочек мы его и так приближаем боксом. }
+    if I.m[0] > 0 then b^.invIlocal.x := 1.0 / I.m[0];
+    if I.m[4] > 0 then b^.invIlocal.y := 1.0 / I.m[4];
+    if I.m[8] > 0 then b^.invIlocal.z := 1.0 / I.m[8];
+  end;
+
+  b^.box := shape_aabb(s, pose_make(pos, b^.orient), 0.05);
+  Result := id;
+end;
+
+procedure phys_set_material(id: Integer; friction, restitution: Single);
+begin
+  if (id < 0) or (id >= g_nbodies) then Exit;
+  g_bodies[id].friction := friction;
+  g_bodies[id].restitution := restitution;
+end;
+
+procedure phys_wake(id: Integer);
+begin
+  if (id < 0) or (id >= g_nbodies) then Exit;
+  g_bodies[id].flags := g_bodies[id].flags - [BF_SLEEPING];
+  g_bodies[id].sleepTimer := 0;
+end;
+
+procedure phys_apply_impulse(id: Integer; const imp, point: TVec3);
+var
+  b: PBody;
+  r: TVec3;
+begin
+  if (id < 0) or (id >= g_nbodies) then Exit;
+  b := @g_bodies[id];
+  if not body_is_dynamic(b^) then Exit;
+  phys_wake(id);
+  b^.linvel := v3_mad(b^.linvel, imp, b^.invMass);
+  r := v3_sub(point, b^.pos);
+  b^.angvel := v3_add(b^.angvel, m3_mulv(b^.invIworld, v3_cross(r, imp)));
+end;
+
+procedure phys_apply_force(id: Integer; const f: TVec3);
+begin
+  if (id < 0) or (id >= g_nbodies) then Exit;
+  phys_wake(id);
+  g_bodies[id].force := v3_add(g_bodies[id].force, f);
+end;
+
+{ Пересчёт обратного тензора инерции в мировые оси: Iw = R * Il * R^T. }
+procedure update_inertia(var b: TBody); inline;
+var
+  R, Rt, tmp: TMat3;
+  i: Integer;
+begin
+  if b.invMass = 0 then
+  begin
+    b.invIworld := m3_identity;
+    b.invIworld.m[0] := 0; b.invIworld.m[4] := 0; b.invIworld.m[8] := 0;
+    Exit;
+  end;
+  R := m3_from_quat(b.orient);
+  Rt := m3_transpose(R);
+  tmp := Rt;
+  { умножаем строки Rt на диагональ -- дешевле полного произведения }
+  for i := 0 to 2 do
+  begin
+    tmp.m[i * 3 + 0] := Rt.m[i * 3 + 0] * b.invIlocal.x;
+    tmp.m[i * 3 + 1] := Rt.m[i * 3 + 1] * b.invIlocal.y;
+    tmp.m[i * 3 + 2] := Rt.m[i * 3 + 2] * b.invIlocal.z;
+  end;
+  b.invIworld := m3_mul(R, tmp);
+end;
+
+{ =========================================================================
+  Широкая фаза: sweep and prune по оси X
+
+  Сортируем индексы тел по минимуму AABB (сортировка вставками -- массив
+  почти отсортирован с прошлого кадра, то есть O(n)), затем сканируем
+  "активный" список. Для нескольких тысяч тел это держится в единицах
+  микросекунд и не плодит мусора.
+  ========================================================================= }
+
+type
+  TPair = record
+    a, b: Integer;
+  end;
+
+var
+  g_sorted : array[0..PHYS_MAX_BODIES - 1] of Integer;
+  g_nsorted: Integer = 0;
+  g_pairs  : array[0..PHYS_MAX_PAIRS - 1] of TPair;
+  g_npairs : Integer = 0;
+
+procedure broadphase;
+var
+  i, j, k, tmp: Integer;
+  minx: Single;
+begin
+  { 1. Поддерживаем список индексов. }
+  if g_nsorted <> g_nbodies then
+  begin
+    for i := 0 to g_nbodies - 1 do g_sorted[i] := i;
+    g_nsorted := g_nbodies;
+  end;
+
+  { 2. Сортировка вставками по g_bodies[].box.mn.x }
+  for i := 1 to g_nsorted - 1 do
+  begin
+    tmp := g_sorted[i];
+    minx := g_bodies[tmp].box.mn.x;
+    j := i - 1;
+    while (j >= 0) and (g_bodies[g_sorted[j]].box.mn.x > minx) do
+    begin
+      g_sorted[j + 1] := g_sorted[j];
+      Dec(j);
+    end;
+    g_sorted[j + 1] := tmp;
+  end;
+
+  { 3. Скан: пока максимум по X перекрывает минимум соседа -- проверяем. }
+  g_npairs := 0;
+  for i := 0 to g_nsorted - 1 do
+  begin
+    j := g_sorted[i];
+    k := i + 1;
+    while k < g_nsorted do
+    begin
+      if g_bodies[g_sorted[k]].box.mn.x > g_bodies[j].box.mx.x then Break;
+
+      { Два статических тела друг другу не интересны. }
+      if (g_bodies[j].invMass > 0) or (g_bodies[g_sorted[k]].invMass > 0) then
+        if not ((BF_SLEEPING in g_bodies[j].flags) and
+                (BF_SLEEPING in g_bodies[g_sorted[k]].flags)) then
+          if aabb_overlap(g_bodies[j].box, g_bodies[g_sorted[k]].box) then
+           if not phys_pair_ignored(j, g_sorted[k]) then
+            if g_npairs < PHYS_MAX_PAIRS then
+            begin
+              if j < g_sorted[k] then
+              begin
+                g_pairs[g_npairs].a := j;
+                g_pairs[g_npairs].b := g_sorted[k];
+              end
+              else
+              begin
+                g_pairs[g_npairs].a := g_sorted[k];
+                g_pairs[g_npairs].b := j;
+              end;
+              Inc(g_npairs);
+            end;
+      Inc(k);
+    end;
+  end;
+  g_stat_pairs := g_npairs;
+end;
+
+{ =========================================================================
+  Манифолды
+  ========================================================================= }
+
+{ Поиск манифолда по паре тел. Линейный перебор здесь был бы квадратичным
+  (тысячи пар против тысяч манифолдов), поэтому держим хеш-таблицу с
+  цепочками: таблица и цепочки -- обычные массивы, память не выделяется. }
+const
+  MF_HASH_SIZE = 16384;        { степень двойки, маска ниже }
+  MF_HASH_MASK = MF_HASH_SIZE - 1;
+
+var
+  g_mf_hash: array[0..MF_HASH_SIZE - 1] of Integer;
+  g_mf_next: array[0..PHYS_MAX_MANIFOLDS - 1] of Integer;
+
+function mf_key(a, b: Integer): Integer; inline;
+begin
+  { Перемешивание большими простыми числами -- классика из Teschner et al. }
+  Result := ((a * 73856093) xor (b * 19349663)) and MF_HASH_MASK;
+end;
+
+procedure mf_hash_rebuild;
+var i, k: Integer;
+begin
+  FillChar(g_mf_hash, SizeOf(g_mf_hash), $FF);
+  for i := 0 to g_nmanifolds - 1 do
+  begin
+    k := mf_key(g_manifolds[i].a, g_manifolds[i].b);
+    g_mf_next[i] := g_mf_hash[k];
+    g_mf_hash[k] := i;
+  end;
+end;
+
+procedure mf_hash_insert(i: Integer); inline;
+var k: Integer;
+begin
+  k := mf_key(g_manifolds[i].a, g_manifolds[i].b);
+  g_mf_next[i] := g_mf_hash[k];
+  g_mf_hash[k] := i;
+end;
+
+function find_manifold(a, b: Integer): Integer;
+var i: Integer;
+begin
+  i := g_mf_hash[mf_key(a, b)];
+  while i >= 0 do
+  begin
+    if (g_manifolds[i].a = a) and (g_manifolds[i].b = b) then
+    begin
+      Result := i;
+      Exit;
+    end;
+    i := g_mf_next[i];
+  end;
+  Result := -1;
+end;
+
+{ Добавляем новую точку в манифолд. Если рядом уже есть старая точка --
+  обновляем её и сохраняем накопленный импульс. }
+procedure manifold_add_point(var mf: TManifold; const pa, pb, n: TVec3;
+                             depth: Single);
+var
+  ba, bb: PBody;
+  la, lb: TVec3;
+  i, worst: Integer;
+  d, maxd: Single;
+  np: TContactPoint;
+begin
+  ba := @g_bodies[mf.a];
+  bb := @g_bodies[mf.b];
+
+  la := q_rotate(q_conj(ba^.orient), v3_sub(pa, ba^.pos));
+  lb := q_rotate(q_conj(bb^.orient), v3_sub(pb, bb^.pos));
+
+  { Ищем совпадение со старой точкой. }
+  for i := 0 to mf.npoints - 1 do
+    if (v3_distsq(mf.pt[i].localA, la) < PHYS_CONTACT_TOL * PHYS_CONTACT_TOL) or
+       (v3_distsq(mf.pt[i].localB, lb) < PHYS_CONTACT_TOL * PHYS_CONTACT_TOL) then
+    begin
+      mf.pt[i].localA := la;
+      mf.pt[i].localB := lb;
+      mf.pt[i].penetration := depth;
+      Inc(mf.pt[i].age);
+      Exit;
+    end;
+
+  FillChar(np, SizeOf(np), 0);
+  np.localA := la;
+  np.localB := lb;
+  np.penetration := depth;
+  np.age := 0;
+
+  if mf.npoints < PHYS_MAX_POINTS then
+  begin
+    mf.pt[mf.npoints] := np;
+    Inc(mf.npoints);
+    Exit;
+  end;
+
+  { Манифолд полон -- выкидываем точку с наименьшим вкладом: ту, что
+    ближе всего к остальным (так сохраняется максимальная площадь опоры). }
+  worst := 0;
+  maxd := -1;
+  for i := 0 to PHYS_MAX_POINTS - 1 do
+  begin
+    d := v3_distsq(mf.pt[i].localA, la);
+    if (maxd < 0) or (d < maxd) then
+    begin
+      maxd := d;
+      worst := i;
+    end;
+  end;
+  mf.pt[worst] := np;
+end;
+
+{ Отбрасываем точки, которые "уехали" вместе с телами. }
+procedure manifold_refresh(var mf: TManifold);
+var
+  i, j: Integer;
+  ba, bb: PBody;
+  wa, wb, dv: TVec3;
+  pen, tanLen: Single;
+begin
+  ba := @g_bodies[mf.a];
+  bb := @g_bodies[mf.b];
+  j := 0;
+  for i := 0 to mf.npoints - 1 do
+  begin
+    wa := v3_add(ba^.pos, q_rotate(ba^.orient, mf.pt[i].localA));
+    wb := v3_add(bb^.pos, q_rotate(bb^.orient, mf.pt[i].localB));
+    dv := v3_sub(wb, wa);
+    pen := -v3_dot(dv, mf.normal);
+
+    { 1. Точка разошлась вдоль нормали. }
+    if pen < -PHYS_CONTACT_TOL then Continue;
+    { 2. Точка уехала вбок (тела проскользнули). }
+    tanLen := v3_lensq(v3_sub(dv, v3_mul(mf.normal, -pen)));
+    if tanLen > PHYS_CONTACT_TOL * PHYS_CONTACT_TOL * 16.0 then Continue;
+
+    mf.pt[i].penetration := pen;
+    if j <> i then mf.pt[j] := mf.pt[i];
+    Inc(j);
+  end;
+  mf.npoints := j;
+end;
+
+{ Временный буфер для уплотнения списка манифолдов. Он статический:
+  класть 8192 манифолда на стек нельзя, а выделять память каждый кадр -- вредно. }
+var
+  g_mf_tmp: array[0..PHYS_MAX_MANIFOLDS - 1] of TManifold;
+
+{ Доп. точки контакта за счёт малого доворота тела A вокруг осей,
+  перпендикулярных нормали. Приём из Bullet: на первом кадре удара GJK даёт
+  всего одну точку, и плоско падающий ящик успевает подпрыгнуть и уехать
+  вбок. Четыре дешёвых повторных запроса сразу дают полную площадь опоры. }
+procedure add_perturbed_points(var mf: TManifold; a, b: Integer;
+                               const res: TGJKResult);
+var
+  t1, t2, axis, ptA: TVec3;
+  qp: TQuat;
+  pa2, pb0: TPose;
+  r2: TGJKResult;
+  k: Integer;
+  ang: Single;
+begin
+  v3_basis(res.normal, t1, t2);
+  pb0 := phys_pose(b);
+  for k := 0 to 3 do
+  begin
+    if mf.npoints >= PHYS_MAX_POINTS then Exit;
+    ang := k * PI_F * 0.5;
+    axis := v3_add(v3_mul(t1, Cos(ang)), v3_mul(t2, Sin(ang)));
+    qp := q_from_axis(axis, PHYS_PERTURB);
+
+    pa2.p := g_bodies[a].pos;
+    pa2.q := q_mul(qp, g_bodies[a].orient);
+
+    if not gjk_collide(g_shapes[a], pa2, g_shapes[b], pb0, r2) then Continue;
+    { Берём точку, только если она про тот же контакт, а не про другую грань. }
+    if v3_dot(r2.normal, res.normal) < 0.9 then Continue;
+
+    { Возвращаем найденную точку из повёрнутой системы обратно. }
+    ptA := v3_add(pa2.p, q_rotate(q_conj(qp), v3_sub(r2.pointA, pa2.p)));
+    manifold_add_point(mf, ptA, r2.pointB, res.normal, r2.depth);
+  end;
+end;
+
+procedure narrowphase;
+var
+  i, k, mi: Integer;
+  res: TGJKResult;
+  pa, pb: TPose;
+  a, b: Integer;
+  mf: PManifold;
+  nnew: Integer;
+begin
+  { Сначала помечаем все манифолды мёртвыми; выжившие пометим заново. }
+  for i := 0 to g_nmanifolds - 1 do
+    g_manifolds[i].alive := False;
+  mf_hash_rebuild;
+
+  g_stat_contacts := 0;
+
+  for i := 0 to g_npairs - 1 do
+  begin
+    a := g_pairs[i].a;
+    b := g_pairs[i].b;
+    pa := phys_pose(a);
+    pb := phys_pose(b);
+
+    if not gjk_collide(g_shapes[a], pa, g_shapes[b], pb, res) then
+      Continue;
+
+    mi := find_manifold(a, b);
+    if mi < 0 then
+    begin
+      if g_nmanifolds >= PHYS_MAX_MANIFOLDS then Continue;
+      mi := g_nmanifolds;
+      Inc(g_nmanifolds);
+      FillChar(g_manifolds[mi], SizeOf(TManifold), 0);
+      g_manifolds[mi].a := a;
+      g_manifolds[mi].b := b;
+      mf_hash_insert(mi);
+    end;
+
+    mf := @g_manifolds[mi];
+    mf^.alive := True;
+    mf^.normal := res.normal;
+    v3_basis(mf^.normal, mf^.tangent[0], mf^.tangent[1]);
+
+    { Материалы смешиваем геометрически и по минимуму -- так делают
+      почти все движки, включая Bullet. }
+    mf^.friction := Sqrt(g_bodies[a].friction * g_bodies[b].friction);
+    if g_bodies[a].restitution > g_bodies[b].restitution then
+      mf^.restitution := g_bodies[a].restitution
+    else
+      mf^.restitution := g_bodies[b].restitution;
+
+    manifold_refresh(mf^);
+    manifold_add_point(mf^, res.pointA, res.pointB, res.normal, res.depth);
+
+    { Пока площадка опоры неполная -- добираем точки довёрнутыми запросами.
+      На установившемся контакте этот путь не выполняется вовсе. }
+    if mf^.npoints < 3 then
+      add_perturbed_points(mf^, a, b, res);
+
+    Inc(g_stat_contacts, mf^.npoints);
+  end;
+
+  { Уплотняем список манифолдов. }
+  nnew := 0;
+  for i := 0 to g_nmanifolds - 1 do
+    if g_manifolds[i].alive and (g_manifolds[i].npoints > 0) then
+    begin
+      g_mf_tmp[nnew] := g_manifolds[i];
+      Inc(nnew);
+    end;
+  for i := 0 to nnew - 1 do
+    g_manifolds[i] := g_mf_tmp[i];
+  g_nmanifolds := nnew;
+
+  { Защита от ситуации, когда манифолд остался, а точек в нём нет. }
+  for i := 0 to g_nmanifolds - 1 do
+    for k := 0 to g_manifolds[i].npoints - 1 do
+      g_manifolds[i].pt[k].bias := 0;
+end;
+
+{ =========================================================================
+  Решатель последовательных импульсов
+
+  Классика Catto/Quake: для каждой точки контакта считаем эффективную массу
+  вдоль нормали и двух касательных, затем много раз подряд правим скорости
+  малыми импульсами. Схема нетребовательна к памяти и прекрасно ложится
+  в кэш, если данные лежат плотно, что у нас и сделано.
+  ========================================================================= }
+
+procedure solver_prepare(dt: Single);
+var
+  i, k: Integer;
+  mf: PManifold;
+  ba, bb: PBody;
+  cp: ^TContactPoint;
+  wa, wb, rv, tmpA, tmpB: TVec3;
+  kn, kt, vn: Single;
+  invdt: Single;
+begin
+  invdt := 1.0 / dt;
+
+  for i := 0 to g_nmanifolds - 1 do
+  begin
+    mf := @g_manifolds[i];
+    ba := @g_bodies[mf^.a];
+    bb := @g_bodies[mf^.b];
+
+    for k := 0 to mf^.npoints - 1 do
+    begin
+      cp := @mf^.pt[k];
+
+      wa := v3_add(ba^.pos, q_rotate(ba^.orient, cp^.localA));
+      wb := v3_add(bb^.pos, q_rotate(bb^.orient, cp^.localB));
+      cp^.rA := v3_sub(wa, ba^.pos);
+      cp^.rB := v3_sub(wb, bb^.pos);
+
+      { Эффективная масса вдоль нормали:
+        1/m = ima + imb + n . ((Ia^-1 (ra x n)) x ra + ...) }
+      tmpA := v3_cross(m3_mulv(ba^.invIworld, v3_cross(cp^.rA, mf^.normal)), cp^.rA);
+      tmpB := v3_cross(m3_mulv(bb^.invIworld, v3_cross(cp^.rB, mf^.normal)), cp^.rB);
+      kn := ba^.invMass + bb^.invMass +
+            v3_dot(mf^.normal, v3_add(tmpA, tmpB));
+      if kn > EPS then cp^.massNormal := 1.0 / kn else cp^.massNormal := 0;
+
+      tmpA := v3_cross(m3_mulv(ba^.invIworld, v3_cross(cp^.rA, mf^.tangent[0])), cp^.rA);
+      tmpB := v3_cross(m3_mulv(bb^.invIworld, v3_cross(cp^.rB, mf^.tangent[0])), cp^.rB);
+      kt := ba^.invMass + bb^.invMass + v3_dot(mf^.tangent[0], v3_add(tmpA, tmpB));
+      if kt > EPS then cp^.massTang[0] := 1.0 / kt else cp^.massTang[0] := 0;
+
+      tmpA := v3_cross(m3_mulv(ba^.invIworld, v3_cross(cp^.rA, mf^.tangent[1])), cp^.rA);
+      tmpB := v3_cross(m3_mulv(bb^.invIworld, v3_cross(cp^.rB, mf^.tangent[1])), cp^.rB);
+      kt := ba^.invMass + bb^.invMass + v3_dot(mf^.tangent[1], v3_add(tmpA, tmpB));
+      if kt > EPS then cp^.massTang[1] := 1.0 / kt else cp^.massTang[1] := 0;
+
+      { Смещение Баумгарта: загоняем проникновение обратно, но не быстрее
+        PHYS_MAX_CORRECT за шаг, иначе стопки тел взрываются. }
+      cp^.bias := -fmin(PHYS_BAUMGARTE * invdt *
+                  fmax(cp^.penetration - PHYS_SLOP, 0.0), PHYS_MAX_BIAS);
+
+      { Запоминаем скорость сближения для расчёта отскока. }
+      rv := v3_sub(v3_add(bb^.linvel, v3_cross(bb^.angvel, cp^.rB)),
+                   v3_add(ba^.linvel, v3_cross(ba^.angvel, cp^.rA)));
+      vn := v3_dot(rv, mf^.normal);
+      cp^.relvel0 := vn;
+
+      { Тёплый старт: сразу прикладываем импульсы с прошлого кадра.
+        Это главное, что делает стопки ящиков устойчивыми. }
+      if cp^.age > 0 then
+      begin
+        tmpA := v3_add(v3_mul(mf^.normal, cp^.normalImpulse),
+                v3_add(v3_mul(mf^.tangent[0], cp^.tangImpulse[0]),
+                       v3_mul(mf^.tangent[1], cp^.tangImpulse[1])));
+        if ba^.invMass > 0 then
+        begin
+          ba^.linvel := v3_mad(ba^.linvel, tmpA, -ba^.invMass);
+          ba^.angvel := v3_sub(ba^.angvel,
+            m3_mulv(ba^.invIworld, v3_cross(cp^.rA, tmpA)));
+        end;
+        if bb^.invMass > 0 then
+        begin
+          bb^.linvel := v3_mad(bb^.linvel, tmpA, bb^.invMass);
+          bb^.angvel := v3_add(bb^.angvel,
+            m3_mulv(bb^.invIworld, v3_cross(cp^.rB, tmpA)));
+        end;
+      end
+      else
+      begin
+        cp^.normalImpulse := 0;
+        cp^.tangImpulse[0] := 0;
+        cp^.tangImpulse[1] := 0;
+      end;
+    end;
+  end;
+end;
+
+procedure solver_iterate;
+var
+  i, k, t: Integer;
+  mf: PManifold;
+  ba, bb: PBody;
+  cp: ^TContactPoint;
+  rv, imp: TVec3;
+  vn, vt, lambda, oldimp, maxf, rest: Single;
+begin
+  for i := 0 to g_nmanifolds - 1 do
+  begin
+    mf := @g_manifolds[i];
+    ba := @g_bodies[mf^.a];
+    bb := @g_bodies[mf^.b];
+
+    for k := 0 to mf^.npoints - 1 do
+    begin
+      cp := @mf^.pt[k];
+
+      { --- трение (считаем до нормали: так устойчивее при больших силах) --- }
+      for t := 0 to 1 do
+      begin
+        rv := v3_sub(v3_add(bb^.linvel, v3_cross(bb^.angvel, cp^.rB)),
+                     v3_add(ba^.linvel, v3_cross(ba^.angvel, cp^.rA)));
+        vt := v3_dot(rv, mf^.tangent[t]);
+        lambda := -vt * cp^.massTang[t];
+
+        maxf := mf^.friction * cp^.normalImpulse;
+        oldimp := cp^.tangImpulse[t];
+        cp^.tangImpulse[t] := fclamp(oldimp + lambda, -maxf, maxf);
+        lambda := cp^.tangImpulse[t] - oldimp;
+
+        imp := v3_mul(mf^.tangent[t], lambda);
+        if ba^.invMass > 0 then
+        begin
+          ba^.linvel := v3_mad(ba^.linvel, imp, -ba^.invMass);
+          ba^.angvel := v3_sub(ba^.angvel,
+            m3_mulv(ba^.invIworld, v3_cross(cp^.rA, imp)));
+        end;
+        if bb^.invMass > 0 then
+        begin
+          bb^.linvel := v3_mad(bb^.linvel, imp, bb^.invMass);
+          bb^.angvel := v3_add(bb^.angvel,
+            m3_mulv(bb^.invIworld, v3_cross(cp^.rB, imp)));
+        end;
+      end;
+
+      { --- нормаль --- }
+      rv := v3_sub(v3_add(bb^.linvel, v3_cross(bb^.angvel, cp^.rB)),
+                   v3_add(ba^.linvel, v3_cross(ba^.angvel, cp^.rA)));
+      vn := v3_dot(rv, mf^.normal);
+
+      { Отскок включаем только при заметной скорости удара, иначе тела
+        никогда не успокоятся. }
+      rest := 0;
+      if cp^.relvel0 < -PHYS_REST_THRESH then
+        rest := -mf^.restitution * cp^.relvel0;
+
+      lambda := -(vn - rest + cp^.bias) * cp^.massNormal;
+
+      { Проекция на допустимое множество: суммарный импульс >= 0. }
+      oldimp := cp^.normalImpulse;
+      cp^.normalImpulse := fmax(oldimp + lambda, 0.0);
+      lambda := cp^.normalImpulse - oldimp;
+
+      imp := v3_mul(mf^.normal, lambda);
+      if ba^.invMass > 0 then
+      begin
+        ba^.linvel := v3_mad(ba^.linvel, imp, -ba^.invMass);
+        ba^.angvel := v3_sub(ba^.angvel,
+          m3_mulv(ba^.invIworld, v3_cross(cp^.rA, imp)));
+      end;
+      if bb^.invMass > 0 then
+      begin
+        bb^.linvel := v3_mad(bb^.linvel, imp, bb^.invMass);
+        bb^.angvel := v3_add(bb^.angvel,
+          m3_mulv(bb^.invIworld, v3_cross(cp^.rB, imp)));
+      end;
+    end;
+  end;
+end;
+
+{ Прямая позиционная коррекция остаточного проникновения.
+  Делается после решателя скоростей и не вносит энергии в систему. }
+procedure solver_positions;
+var
+  i, k, it: Integer;
+  mf: PManifold;
+  ba, bb: PBody;
+  cp: ^TContactPoint;
+  wa, wb: TVec3;
+  pen, corr, totalInv: Single;
+begin
+  for it := 1 to PHYS_POS_ITERS do
+    for i := 0 to g_nmanifolds - 1 do
+    begin
+      mf := @g_manifolds[i];
+      ba := @g_bodies[mf^.a];
+      bb := @g_bodies[mf^.b];
+      totalInv := ba^.invMass + bb^.invMass;
+      if totalInv <= EPS then Continue;
+
+      for k := 0 to mf^.npoints - 1 do
+      begin
+        cp := @mf^.pt[k];
+        wa := v3_add(ba^.pos, q_rotate(ba^.orient, cp^.localA));
+        wb := v3_add(bb^.pos, q_rotate(bb^.orient, cp^.localB));
+        pen := -v3_dot(v3_sub(wb, wa), mf^.normal);
+        if pen <= PHYS_SLOP then Continue;
+
+        corr := fmin(pen - PHYS_SLOP, PHYS_MAX_CORRECT) * PHYS_POS_RELAX / totalInv;
+        if ba^.invMass > 0 then
+          ba^.pos := v3_mad(ba^.pos, mf^.normal, -corr * ba^.invMass);
+        if bb^.invMass > 0 then
+          bb^.pos := v3_mad(bb^.pos, mf^.normal, corr * bb^.invMass);
+      end;
+    end;
+end;
+
+{ =========================================================================
+  Интегрирование
+  ========================================================================= }
+
+procedure integrate_velocities(dt: Single);
+var
+  i: Integer;
+  b: PBody;
+  ld, ad: Single;
+begin
+  for i := 0 to g_nbodies - 1 do
+  begin
+    b := @g_bodies[i];
+    if not body_active(b^) then
+    begin
+      b^.force := v3_zero;
+      b^.torque := v3_zero;
+      Continue;
+    end;
+
+    update_inertia(b^);
+
+    b^.linvel := v3_add(b^.linvel,
+      v3_mul(v3_add(g_gravity, v3_mul(b^.force, b^.invMass)), dt));
+    b^.angvel := v3_add(b^.angvel, v3_mul(m3_mulv(b^.invIworld, b^.torque), dt));
+
+    { Экспоненциальное затухание, независимое от шага. }
+    ld := 1.0 / (1.0 + dt * b^.linDamp * 10.0);
+    ad := 1.0 / (1.0 + dt * b^.angDamp * 10.0);
+    b^.linvel := v3_mul(b^.linvel, ld);
+    b^.angvel := v3_mul(b^.angvel, ad);
+
+    b^.force := v3_zero;
+    b^.torque := v3_zero;
+  end;
+end;
+
+procedure integrate_positions(dt: Single);
+var
+  i: Integer;
+  b: PBody;
+  v2, w2: Single;
+begin
+  g_stat_awake := 0;
+  for i := 0 to g_nbodies - 1 do
+  begin
+    b := @g_bodies[i];
+    if not body_active(b^) then Continue;
+
+    b^.pos := v3_mad(b^.pos, b^.linvel, dt);
+    if not (BF_LOCK_ROT in b^.flags) then
+      b^.orient := q_integrate(b^.orient, b^.angvel, dt);
+
+    { Копим время покоя. Само решение "уснуть" принимается позже, сразу
+      для всего острова соприкасающихся тел -- см. resolve_sleeping. }
+    v2 := v3_lensq(b^.linvel);
+    w2 := v3_lensq(b^.angvel);
+    if (v2 < PHYS_SLEEP_LIN * PHYS_SLEEP_LIN) and
+       (w2 < PHYS_SLEEP_ANG * PHYS_SLEEP_ANG) and
+       not (BF_NOSLEEP in b^.flags) then
+      b^.sleepTimer := b^.sleepTimer + dt
+    else
+      b^.sleepTimer := 0;
+
+    Inc(g_stat_awake);
+  end;
+
+  { Обновляем AABB только у тех, кто двигался. }
+  for i := 0 to g_nbodies - 1 do
+  begin
+    b := @g_bodies[i];
+    if (BF_SLEEPING in b^.flags) and (b^.box.mx.x > b^.box.mn.x) then Continue;
+    b^.box := shape_aabb(g_shapes[i], pose_make(b^.pos, b^.orient), 0.05);
+  end;
+end;
+
+{ =========================================================================
+  Засыпание островами
+
+  Тело нельзя усыплять в одиночку: если нижний ящик стопки уснёт раньше
+  верхнего, верхний начнёт его будить, и так до бесконечности. Поэтому
+  соприкасающиеся тела объединяются в острова (система непересекающихся
+  множеств со сжатием путей), и остров засыпает целиком -- только когда
+  успокоились все его тела. Тот же механизм будит остров обратно, если
+  в него прилетело что-то движущееся.
+  ========================================================================= }
+
+var
+  g_island    : array[0..PHYS_MAX_BODIES - 1] of Integer;
+  g_island_min: array[0..PHYS_MAX_BODIES - 1] of Single;
+  g_island_mov: array[0..PHYS_MAX_BODIES - 1] of Boolean;
+
+function island_find(x: Integer): Integer;
+var r, n: Integer;
+begin
+  r := x;
+  while g_island[r] <> r do r := g_island[r];
+  { сжатие пути: следующий поиск будет за один шаг }
+  while g_island[x] <> r do
+  begin
+    n := g_island[x];
+    g_island[x] := r;
+    x := n;
+  end;
+  Result := r;
+end;
+
+procedure island_union(a, b: Integer); inline;
+var ra, rb: Integer;
+begin
+  ra := island_find(a);
+  rb := island_find(b);
+  if ra <> rb then g_island[ra] := rb;
+end;
+
+procedure resolve_sleeping;
+var
+  i, r: Integer;
+  b: PBody;
+begin
+  for i := 0 to g_nbodies - 1 do
+  begin
+    g_island[i] := i;
+    g_island_min[i] := 1.0e30;
+    g_island_mov[i] := False;
+  end;
+
+  { Связываем только динамические пары: статика не передаёт движение. }
+  for i := 0 to g_nmanifolds - 1 do
+    if (g_bodies[g_manifolds[i].a].invMass > 0) and
+       (g_bodies[g_manifolds[i].b].invMass > 0) then
+      island_union(g_manifolds[i].a, g_manifolds[i].b);
+
+  { Сустав связывает тела жёстче любого контакта. Если этого не учесть,
+    половина рэгдола уснёт, а вторая останется активной: решатель будет
+    и дальше слать импульсы спящим телам, те их накопят в своей угловой
+    скорости и при пробуждении разлетятся. }
+  for i := 0 to g_njoints - 1 do
+    if g_joints[i].enabled and (not g_joints[i].broken) then
+      if (g_bodies[g_joints[i].a].invMass > 0) and
+         (g_bodies[g_joints[i].b].invMass > 0) then
+        island_union(g_joints[i].a, g_joints[i].b);
+
+  { Сводим по острову минимальное время покоя и признак движения. }
+  for i := 0 to g_nbodies - 1 do
+  begin
+    b := @g_bodies[i];
+    if not body_is_dynamic(b^) then Continue;
+    if not (BF_ENABLED in b^.flags) then Continue;
+    r := island_find(i);
+    if BF_SLEEPING in b^.flags then Continue;
+    if b^.sleepTimer < g_island_min[r] then g_island_min[r] := b^.sleepTimer;
+    if b^.sleepTimer = 0 then g_island_mov[r] := True;
+  end;
+
+  g_stat_awake := 0;
+  for i := 0 to g_nbodies - 1 do
+  begin
+    b := @g_bodies[i];
+    if not body_is_dynamic(b^) then Continue;
+    if not (BF_ENABLED in b^.flags) then Continue;
+    r := island_find(i);
+
+    if g_island_mov[r] then
+    begin
+      { В острове есть реально движущееся тело -- будим всех. }
+      if BF_SLEEPING in b^.flags then
+      begin
+        b^.flags := b^.flags - [BF_SLEEPING];
+        b^.sleepTimer := 0;
+      end;
+    end
+    else if (g_island_min[r] > PHYS_SLEEP_TIME) and
+            not (BF_NOSLEEP in b^.flags) then
+    begin
+      b^.flags := b^.flags + [BF_SLEEPING];
+      b^.linvel := v3_zero;
+      b^.angvel := v3_zero;
+    end;
+
+    if not (BF_SLEEPING in b^.flags) then Inc(g_stat_awake);
+  end;
+end;
+
+{ =========================================================================
+  Суставы
+
+  Решатель тот же, что и для контактов: последовательные импульсы.
+  Порядок внутри одной итерации важен -- сначала пределы (они жёсткие),
+  потом мотор (он мягкий), потом точка крепления.
+  ========================================================================= }
+
+{ --- запрет столкновений для пар связанных тел ---
+  Храним хеш-множество пар: у рэгдола соседние кости перекрываются по
+  построению, и без этого они будут непрерывно расталкивать друг друга. }
+const
+  IGN_SIZE = 2048;
+  IGN_MASK = IGN_SIZE - 1;
+
+var
+  g_ign_a: array[0..IGN_SIZE - 1] of Integer;
+  g_ign_b: array[0..IGN_SIZE - 1] of Integer;
+  g_ign_n: Integer = 0;
+
+procedure ign_clear;
+var i: Integer;
+begin
+  for i := 0 to IGN_SIZE - 1 do g_ign_a[i] := -1;
+  g_ign_n := 0;
+end;
+
+function ign_slot(a, b: Integer): Integer; inline;
+begin
+  Result := ((a * 73856093) xor (b * 19349663)) and IGN_MASK;
+end;
+
+procedure phys_ignore_pair(a, b: Integer);
+var i, t, slot: Integer;
+begin
+  if a > b then begin t := a; a := b; b := t; end;
+  slot := ign_slot(a, b);
+  for i := 0 to IGN_SIZE - 1 do
+  begin
+    if g_ign_a[slot] = -1 then
+    begin
+      g_ign_a[slot] := a;
+      g_ign_b[slot] := b;
+      Inc(g_ign_n);
+      Exit;
+    end;
+    if (g_ign_a[slot] = a) and (g_ign_b[slot] = b) then Exit;
+    slot := (slot + 1) and IGN_MASK;
+  end;
+end;
+
+function phys_pair_ignored(a, b: Integer): Boolean;
+var i, t, slot: Integer;
+begin
+  Result := False;
+  if g_ign_n = 0 then Exit;
+  if a > b then begin t := a; a := b; b := t; end;
+  slot := ign_slot(a, b);
+  for i := 0 to IGN_SIZE - 1 do
+  begin
+    if g_ign_a[slot] = -1 then Exit;
+    if (g_ign_a[slot] = a) and (g_ign_b[slot] = b) then
+    begin
+      Result := True;
+      Exit;
+    end;
+    slot := (slot + 1) and IGN_MASK;
+  end;
+end;
+
+{ Строит кватернион системы сустава: X вдоль оси кручения, Y вдоль
+  ортогонализованной refAxis. Если refAxis пустая -- берём любой перпендикуляр. }
+function joint_frame_from_axes(const twistAxis, refAxis: TVec3): TQuat;
+var
+  ax, ry, rz, t1, t2: TVec3;
+  m: TMat3;
+begin
+  ax := v3_norm(twistAxis);
+  ry := v3_sub(refAxis, v3_mul(ax, v3_dot(refAxis, ax)));
+  if v3_lensq(ry) < 1.0e-8 then
+  begin
+    v3_basis(ax, t1, t2);
+    ry := t1;
+  end;
+  ry := v3_norm(ry);
+  rz := v3_cross(ax, ry);
+
+  { матрица из трёх колонок -> кватернион }
+  m.m[0] := ax.x; m.m[1] := ax.y; m.m[2] := ax.z;
+  m.m[3] := ry.x; m.m[4] := ry.y; m.m[5] := ry.z;
+  m.m[6] := rz.x; m.m[7] := rz.y; m.m[8] := rz.z;
+  Result := q_from_mat3(m);
+end;
+
+var
+  g_joint_ref_axis: TVec3;
+
+function phys_add_joint_axes(kind: TJointKind; a, b: Integer;
+                             const worldAnchor, twistAxis, refAxis: TVec3): Integer;
+begin
+  g_joint_ref_axis := refAxis;
+  Result := phys_add_joint(kind, a, b, worldAnchor, twistAxis);
+  g_joint_ref_axis := v3_zero;
+end;
+
+function phys_add_joint(kind: TJointKind; a, b: Integer;
+                        const worldAnchor, worldTwistAxis: TVec3): Integer;
+var
+  j: PJoint;
+  qf: TQuat;
+begin
+  Result := -1;
+  if g_njoints >= PHYS_MAX_JOINTS then Exit;
+  Result := g_njoints;
+  Inc(g_njoints);
+
+  j := @g_joints[Result];
+  FillChar(j^, SizeOf(TJoint), 0);
+  j^.kind := kind;
+  j^.a := a;
+  j^.b := b;
+
+  { Якоря -- мировая точка в локальных координатах каждого тела. }
+  j^.localAnchorA := q_rotate(q_conj(g_bodies[a].orient),
+                              v3_sub(worldAnchor, g_bodies[a].pos));
+  j^.localAnchorB := q_rotate(q_conj(g_bodies[b].orient),
+                              v3_sub(worldAnchor, g_bodies[b].pos));
+
+  { Система сустава: ось X смотрит вдоль оси кручения. }
+  qf := joint_frame_from_axes(worldTwistAxis, g_joint_ref_axis);
+  j^.localFrameA := q_mul(q_conj(g_bodies[a].orient), qf);
+  j^.localFrameB := q_mul(q_conj(g_bodies[b].orient), qf);
+
+  j^.target := q_identity;
+  j^.swingLimitY := PI_F;
+  j^.swingLimitZ := PI_F;
+  j^.twistLo := -PI_F;
+  j^.twistHi := PI_F;
+  j^.enabled := True;
+  j^.stiffness := 0;
+  j^.damping := 0;
+  j^.maxTorque := 0;
+
+  if kind = JT_FIXED then
+  begin
+    j^.swingLimitY := 0;
+    j^.swingLimitZ := 0;
+    j^.twistLo := 0;
+    j^.twistHi := 0;
+  end
+  else if kind = JT_HINGE then
+  begin
+    j^.swingLimitY := 0;
+    j^.swingLimitZ := 0;
+  end;
+
+  { Связанные тела друг с другом не сталкиваются. }
+  phys_ignore_pair(a, b);
+end;
+
+procedure phys_joint_limits(id: Integer; swingY, swingZ, twistLo, twistHi: Single);
+begin
+  if (id < 0) or (id >= g_njoints) then Exit;
+  g_joints[id].swingLimitY := swingY;
+  g_joints[id].swingLimitZ := swingZ;
+  g_joints[id].twistLo := twistLo;
+  g_joints[id].twistHi := twistHi;
+end;
+
+procedure phys_joint_motor(id: Integer; on: Boolean;
+                           stiffness, damping, maxTorque: Single);
+begin
+  if (id < 0) or (id >= g_njoints) then Exit;
+  g_joints[id].motor := on;
+  g_joints[id].stiffness := stiffness;
+  g_joints[id].damping := damping;
+  g_joints[id].maxTorque := maxTorque;
+end;
+
+procedure phys_joint_target(id: Integer; const q: TQuat);
+begin
+  if (id < 0) or (id >= g_njoints) then Exit;
+  g_joints[id].target := q_norm(q);
+end;
+
+function joint_frameA(const j: TJoint): TQuat; inline;
+begin
+  Result := q_mul(g_bodies[j.a].orient, j.localFrameA);
+end;
+
+function joint_frameB(const j: TJoint): TQuat; inline;
+begin
+  Result := q_mul(g_bodies[j.b].orient, j.localFrameB);
+end;
+
+function phys_joint_current(id: Integer): TQuat;
+begin
+  if (id < 0) or (id >= g_njoints) then
+  begin
+    Result := q_identity;
+    Exit;
+  end;
+  Result := q_mul(q_conj(joint_frameA(g_joints[id])),
+                  joint_frameB(g_joints[id]));
+end;
+
+function joint_clamp_rotation(const j: TJoint; const qrel: TQuat): TQuat; forward;
+
+procedure phys_add_torque(body: Integer; const t: TVec3);
+begin
+  if (body < 0) or (body >= g_nbodies) then Exit;
+  if not body_is_dynamic(g_bodies[body]) then Exit;
+  g_bodies[body].torque := v3_add(g_bodies[body].torque, t);
+  phys_wake(body);
+end;
+
+procedure phys_joint_add_torque(id: Integer; const t: TVec3);
+begin
+  if (id < 0) or (id >= g_njoints) then Exit;
+  phys_add_torque(g_joints[id].a, t);
+  phys_add_torque(g_joints[id].b, v3_neg(t));
+end;
+
+procedure phys_joint_set_bias_torque(id: Integer; const t: TVec3);
+begin
+  if (id < 0) or (id >= g_njoints) then Exit;
+  g_joints[id].biasTorque := t;
+end;
+
+function phys_joint_limit_error(id: Integer): TVec3;
+var qrel: TQuat;
+begin
+  if (id < 0) or (id >= g_njoints) then
+  begin
+    Result := v3_zero;
+    Exit;
+  end;
+  qrel := phys_joint_current(id);
+  Result := q_to_rotvec(q_mul(joint_clamp_rotation(g_joints[id], qrel),
+                              q_conj(qrel)));
+end;
+
+function phys_joint_torque(id: Integer): Single;
+begin
+  if (id < 0) or (id >= g_njoints) then Result := 0
+  else Result := g_joints[id].lastTorque;
+end;
+
+{ Эффективная масса точечной связи:
+  K = (1/mA + 1/mB)*E - [rA]x * IA^-1 * [rA]x - [rB]x * IB^-1 * [rB]x }
+procedure joint_prepare(dt: Single);
+var
+  i: Integer;
+  j: PJoint;
+  ba, bb: PBody;
+  k, sa, sb: TMat3;
+begin
+  for i := 0 to g_njoints - 1 do
+  begin
+    j := @g_joints[i];
+    if (not j^.enabled) or j^.broken then Continue;
+    ba := @g_bodies[j^.a];
+    bb := @g_bodies[j^.b];
+
+    j^.rA := q_rotate(ba^.orient, j^.localAnchorA);
+    j^.rB := q_rotate(bb^.orient, j^.localAnchorB);
+
+    k := m3_diag(v3(ba^.invMass + bb^.invMass,
+                    ba^.invMass + bb^.invMass,
+                    ba^.invMass + bb^.invMass));
+    sa := m3_skew(j^.rA);
+    sb := m3_skew(j^.rB);
+    k := m3_sub(k, m3_mul(sa, m3_mul(ba^.invIworld, sa)));
+    k := m3_sub(k, m3_mul(sb, m3_mul(bb^.invIworld, sb)));
+    j^.massLin := m3_inverse(k);
+
+    { угловая эффективная масса: (IA^-1 + IB^-1)^-1 }
+    j^.massAng := m3_inverse(m3_add(ba^.invIworld, bb^.invIworld));
+
+    j^.impLin := v3_zero;
+    j^.lastTorque := 0;
+
+    { Сустав держит тела в активном состоянии: спящая кость в рэгдоле
+      выглядит как сломанная. }
+    if j^.motor then
+    begin
+      phys_wake(j^.a);
+      phys_wake(j^.b);
+    end;
+  end;
+end;
+
+{ Применение углового импульса к паре тел. }
+procedure apply_ang_impulse(ba, bb: PBody; const imp: TVec3); inline;
+begin
+  if body_is_dynamic(ba^) then
+    ba^.angvel := v3_sub(ba^.angvel, m3_mulv(ba^.invIworld, imp));
+  if body_is_dynamic(bb^) then
+    bb^.angvel := v3_add(bb^.angvel, m3_mulv(bb^.invIworld, imp));
+end;
+
+{ Ограничение взаимного поворота. Возвращает кватернион, загнанный
+  в пределы конуса и кручения. }
+function joint_clamp_rotation(const j: TJoint; const qrel: TQuat): TQuat;
+var
+  swing, twist: TQuat;
+  sv, tv: TVec3;
+  ang, lim, t: Single;
+begin
+  q_swing_twist(qrel, v3(1, 0, 0), swing, twist);
+
+  { --- кручение --- }
+  tv := q_to_rotvec(twist);
+  t := tv.x;
+  if t < j.twistLo then t := j.twistLo;
+  if t > j.twistHi then t := j.twistHi;
+  twist := q_from_axis(v3(1, 0, 0), t);
+
+  { --- наклон: эллиптический конус по двум осям --- }
+  sv := q_to_rotvec(swing);
+  sv.x := 0;                       { кручение уже вынесено }
+  ang := v3_len(sv);
+  if ang > EPS then
+  begin
+    { предел в направлении текущего наклона -- эллипс между Y и Z }
+    lim := Sqrt(Sqr(sv.y / ang * j.swingLimitY) +
+                Sqr(sv.z / ang * j.swingLimitZ));
+    if ang > lim then
+      sv := v3_mul(sv, lim / ang);
+  end;
+  if v3_len(sv) > EPS then
+    swing := q_from_axis(v3_norm(sv), v3_len(sv))
+  else
+    swing := q_identity;
+
+  Result := q_norm(q_mul(swing, twist));
+end;
+
+{ Одна итерация решателя суставов. }
+procedure joints_iterate(dt: Single);
+var
+  i: Integer;
+  j: PJoint;
+  ba, bb: PBody;
+  fa, fb, qrel, qclamp, qdes, qerr: TQuat;
+  evec, wrel, dw, imp, cv, vrel, bias, cpos: TVec3;
+  invdt, maxImp, l: Single;
+begin
+  if dt <= 0 then Exit;
+  invdt := 1.0 / dt;
+
+  for i := 0 to g_njoints - 1 do
+  begin
+    j := @g_joints[i];
+    if (not j^.enabled) or j^.broken then Continue;
+    ba := @g_bodies[j^.a];
+    bb := @g_bodies[j^.b];
+    { оба спят -- трогать нечего }
+    if (BF_SLEEPING in ba^.flags) and (BF_SLEEPING in bb^.flags) then Continue;
+    { один спит, другой нет -- будим, иначе импульсы уйдут в никуда }
+    if BF_SLEEPING in ba^.flags then phys_wake(j^.a);
+    if BF_SLEEPING in bb^.flags then phys_wake(j^.b);
+
+    fa := joint_frameA(j^);
+    fb := joint_frameB(j^);
+    qrel := q_mul(q_conj(fa), fb);
+    wrel := v3_sub(bb^.angvel, ba^.angvel);
+
+    { ---- 1. пределы: жёстко загоняем ориентацию обратно в конус ---- }
+    qclamp := joint_clamp_rotation(j^, qrel);
+    qdes := q_mul(fa, qclamp);
+    qerr := q_mul(qdes, q_conj(fb));
+    evec := q_to_rotvec(qerr);
+    if v3_lensq(evec) > 1.0e-10 then
+    begin
+      { Нарушение предела снимаем за несколько шагов, иначе сустав
+        выстреливает. Скорость "выпрямления" ограничена. }
+      dw := v3_mul(evec, 0.4 * invdt);
+      l := v3_len(dw);
+      if l > 8.0 then dw := v3_mul(dw, 8.0 / l);
+      { гасим и ту часть взаимного вращения, что уводит дальше за предел }
+      dw := v3_sub(dw, v3_mul(v3_norm(evec),
+                    fmin(v3_dot(wrel, v3_norm(evec)), 0.0)));
+      imp := m3_mulv(j^.massAng, dw);
+      apply_ang_impulse(ba, bb, imp);
+      wrel := v3_sub(bb^.angvel, ba^.angvel);
+    end;
+
+    { ---- 2. мотор: тянем ориентацию к целевой позе ---- }
+    if j^.motor and (j^.maxTorque > 0) then
+    begin
+      qdes := q_mul(fa, joint_clamp_rotation(j^, j^.target));
+      qerr := q_mul(qdes, q_conj(fb));
+      evec := q_to_rotvec(qerr);
+
+      { PD на уровне скоростей: нужная добавка к взаимному вращению. }
+      dw := v3_sub(v3_mul(evec, j^.stiffness), v3_mul(wrel, j^.damping));
+      imp := m3_mulv(j^.massAng, dw);
+
+      { Упреждение. Знак: момент прикладывается к ребёнку, к родителю --
+        обратный, как и у ПД-части. }
+      if not v3_iszero(j^.biasTorque) then
+        imp := v3_add(imp, v3_mul(j^.biasTorque, dt / PHYS_VEL_ITERS));
+
+      maxImp := j^.maxTorque * dt;
+      l := v3_len(imp);
+      if l > maxImp then imp := v3_mul(imp, maxImp / l);
+      j^.lastTorque := v3_len(imp) * invdt;
+
+      apply_ang_impulse(ba, bb, imp);
+    end;
+
+    { ---- 3. точка крепления ---- }
+    cpos := v3_sub(v3_add(bb^.pos, j^.rB), v3_add(ba^.pos, j^.rA));
+    vrel := v3_sub(v3_add(bb^.linvel, v3_cross(bb^.angvel, j^.rB)),
+                   v3_add(ba^.linvel, v3_cross(ba^.angvel, j^.rA)));
+    { небольшое смещение Баумгарта: сустав не должен "плыть" }
+    bias := v3_mul(cpos, 0.2 * invdt);
+    l := v3_len(bias);
+    if l > 3.0 then bias := v3_mul(bias, 3.0 / l);
+
+    cv := v3_add(vrel, bias);
+    imp := v3_neg(m3_mulv(j^.massLin, cv));
+    j^.impLin := v3_add(j^.impLin, imp);
+
+    if body_is_dynamic(ba^) then
+    begin
+      ba^.linvel := v3_sub(ba^.linvel, v3_mul(imp, ba^.invMass));
+      ba^.angvel := v3_sub(ba^.angvel, m3_mulv(ba^.invIworld,
+                                               v3_cross(j^.rA, imp)));
+    end;
+    if body_is_dynamic(bb^) then
+    begin
+      bb^.linvel := v3_add(bb^.linvel, v3_mul(imp, bb^.invMass));
+      bb^.angvel := v3_add(bb^.angvel, m3_mulv(bb^.invIworld,
+                                               v3_cross(j^.rB, imp)));
+    end;
+  end;
+
+  { Разрыв связей: суставу можно задать предел по накопленному импульсу. }
+  for i := 0 to g_njoints - 1 do
+  begin
+    j := @g_joints[i];
+    if j^.broken or (j^.breakForce <= 0) then Continue;
+    if v3_len(j^.impLin) * invdt > j^.breakForce then
+    begin
+      j^.broken := True;
+      phys_wake(j^.a);
+      phys_wake(j^.b);
+    end;
+  end;
+end;
+
+{ Позиционный проход: убираем накопленное расхождение якорей.
+  Без него длинная цепь костей заметно растягивается. }
+procedure joints_positions;
+var
+  i, it: Integer;
+  j: PJoint;
+  ba, bb: PBody;
+  pa, pb, d, corr: TVec3;
+  totalInv, l: Single;
+begin
+  for it := 1 to 4 do
+    for i := 0 to g_njoints - 1 do
+    begin
+      j := @g_joints[i];
+      if (not j^.enabled) or j^.broken then Continue;
+      ba := @g_bodies[j^.a];
+      bb := @g_bodies[j^.b];
+      totalInv := ba^.invMass + bb^.invMass;
+      if totalInv <= EPS then Continue;
+
+      pa := v3_add(ba^.pos, q_rotate(ba^.orient, j^.localAnchorA));
+      pb := v3_add(bb^.pos, q_rotate(bb^.orient, j^.localAnchorB));
+      d := v3_sub(pb, pa);
+      l := v3_len(d);
+      if l < 0.001 then Continue;
+
+      corr := v3_mul(d, 0.8 / totalInv);
+      ba^.pos := v3_add(ba^.pos, v3_mul(corr, ba^.invMass));
+      bb^.pos := v3_sub(bb^.pos, v3_mul(corr, bb^.invMass));
+    end;
+end;
+
+procedure phys_step(dt: Single);
+var i: Integer;
+begin
+  if dt <= 0 then Exit;
+
+  { Пробуждаем всех, кого коснулась внешняя сила. }
+  for i := 0 to g_nbodies - 1 do
+    if not v3_iszero(g_bodies[i].force) then phys_wake(i);
+
+  integrate_velocities(dt);
+  broadphase;
+  narrowphase;
+
+  solver_prepare(dt);
+  joint_prepare(dt);
+  for i := 1 to PHYS_VEL_ITERS do
+  begin
+    joints_iterate(dt);
+    solver_iterate;
+  end;
+
+  integrate_positions(dt);
+  solver_positions;
+  joints_positions;
+  resolve_sleeping;
+
+  { Упреждающие моменты живут один шаг. }
+  for i := 0 to g_njoints - 1 do
+    g_joints[i].biasTorque := v3_zero;
+
+  g_phys_time := g_phys_time + dt;
+end;
+
+{ =========================================================================
+  Трассировка луча
+  ========================================================================= }
+
+{ Быстрый отбор по AABB методом плит (slab method). }
+function ray_aabb(const ro, inv: TVec3; const b: TAABB; maxd: Single): Boolean;
+var
+  t1, t2, tmin, tmax: Single;
+begin
+  t1 := (b.mn.x - ro.x) * inv.x;
+  t2 := (b.mx.x - ro.x) * inv.x;
+  tmin := fmin(t1, t2); tmax := fmax(t1, t2);
+  t1 := (b.mn.y - ro.y) * inv.y;
+  t2 := (b.mx.y - ro.y) * inv.y;
+  tmin := fmax(tmin, fmin(t1, t2)); tmax := fmin(tmax, fmax(t1, t2));
+  t1 := (b.mn.z - ro.z) * inv.z;
+  t2 := (b.mx.z - ro.z) * inv.z;
+  tmin := fmax(tmin, fmin(t1, t2)); tmax := fmin(tmax, fmax(t1, t2));
+  Result := (tmax >= fmax(tmin, 0.0)) and (tmin <= maxd);
+end;
+
+function phys_raycast(const ro, rd: TVec3; maxdist: Single): TRayHit;
+var
+  i: Integer;
+  inv, d: TVec3;
+  n: TVec3;
+  t: Single;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  Result.body := -1;
+  Result.distance := maxdist;
+
+  d := v3_norm(rd);
+  inv.x := 1.0 / (d.x + 1.0e-12);
+  inv.y := 1.0 / (d.y + 1.0e-12);
+  inv.z := 1.0 / (d.z + 1.0e-12);
+
+  for i := 0 to g_nbodies - 1 do
+  begin
+    if not (BF_ENABLED in g_bodies[i].flags) then Continue;
+    if not ray_aabb(ro, inv, g_bodies[i].box, Result.distance) then Continue;
+
+    if gjk_raycast(g_shapes[i], phys_pose(i), ro, d, Result.distance, t, n) then
+      if t < Result.distance then
+      begin
+        Result.hit := True;
+        Result.body := i;
+        Result.distance := t;
+        Result.point := v3_mad(ro, d, t);
+        Result.normal := n;
+      end;
+  end;
+end;
+
+initialization
+  g_gravity := v3(0, -9.81, 0);
+
+end.
